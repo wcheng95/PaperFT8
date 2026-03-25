@@ -1,0 +1,26 @@
+# Build artifacts
+.cache
+/build/
+*.bin
+*.elf
+*.map
+idf_py_*
+main/*.o
+
+# ESP-IDF managed components (auto-fetched by idf.py build)
+/managed_components/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+!release/*.bin

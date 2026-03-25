@@ -1,0 +1,796 @@
+Mini-FT8 main program (high-level text diagram)
+
++-----------------------------------------------------------------------------------+
+|                                   app_main()                                      |
+|-----------------------------------------------------------------------------------|
+|  xTaskCreatePinnedToCore(app_task_core0, core0)                                    |
+|  init_bluetooth()   (ENABLE_BLE ? NimBLE host+GATT : stub)                         |
++------------------------------------+----------------------------------------------+
+                                     |
+                                     v
++-----------------------------------------------------------------------------------+
+|                               app_task_core0()                                    |
+|-----------------------------------------------------------------------------------|
+|  [Boot / Init]                                                                     |
+|   - mount SPIFFS: /spiffs                                                          |
+|   - log_mutex = xSemaphoreCreateMutex()                                            |
+|   - init_soft_uart()    (optional debug UART on GPIO1/2)                           |
+|   - ui_init(); ui_draw_rx()                                                        |
+|   - autoseq_init(); autoseq_set_adif_callback(log_adif_entry)                      |
+|   - load_station_data(): read /spiffs/StationData.ini                              |
+|        * bands, offsets, call/grid, comments, active bands, rtc_comp, etc          |
+|        * rtc_init_from_hw() else rtc_set_from_strings()                            |
+|        * rebuild_active_bands()                                                    |
+|   - update_autoseq_cq_type(); autoseq_set_station(g_call, g_grid)                  |
+|                                                                                   |
+|  [Main UI Loop]  (runs forever, ~10ms tick)                                        |
+|   - read keyboard -> char c (or 0 if none)                                         |
+|   - rtc_tick() -> update time strings                                              |
+|   - update_countdown() -> draw slot progress/even-odd                              |
+|   - check_slot_boundary() -> TX trigger + post-TX tick                             |
+|                                                                                   |
+|   - mode handlers (early-continue sections):                                       |
+|       * HOST   : UAC audio host status screen; only 'h' exits                      |
+|       * CONTROL: USB serial host protocol; poll_host_uart(); 'c/h' exits           |
+|                                                                                   |
+|   - global cancel: '`'  => g_tx_cancel_requested + CAT "RX;"                       |
+|                                                                                   |
+|   - idle work (when c==0 or repeated key):                                         |
+|       * auto-switch RX<->TX screens via g_auto_switch_to_tx/rx                      |
+|       * apply dirty flags:                                                         |
+|            - g_rx_dirty -> ui_set_rx_list + ui_draw_rx()                            |
+|            - g_tx_view_dirty -> redraw_tx_view()                                   |
+|       * ui_draw_waterfall_if_dirty()                                               |
+|       * menu_flash_tick(), rx_flash_tick()                                         |
+|                                                                                   |
+|   - mode switching keys (if not editing MENU):                                     |
+|       r RX, t TX, b BAND, m MENU, n/o MENU page jump,                              |
+|       q QSO, h HOST(UAC), c CONTROL(USB host), d DEBUG, l LIST, s STATUS           |
+|                                                                                   |
+|   - mode-specific key handling (when not switched):                                |
+|       RX: ui_handle_rx_key() -> select decode -> autoseq_on_touch() -> set TX flag |
+|       TX: paginate/drop/rotate QSOs; 'e' encode_and_log_pending_tx()               |
+|       BAND: edit band freqs                                                        |
+|       MENU: edit station fields, send FreeText (manual one-off TX), sleep, etc     |
+|       STATUS: beacon toggle, UAC start/CAT sync, band advance, tune, edit date/time|
+|       DEBUG/LIST/QSO: paging + selection                                           |
+|                                                                                   |
+|   - vTaskDelay(10ms)                                                               |
++-----------------------------------------------------------------------------------+
+
+
+Key runtime subsystems & dataflow
+====================================================================================
+
+(1) RX decode -> autoseq -> schedule TX -> TX task -> autoseq tick
+
+      +------------------+     +------------------------+
+      |  UAC audio host  |     |  (optional) WAV decode |
+      |  stream_uac.*    |     |  decode_wav(path)      |
+      +---------+--------+     +-----------+------------+
+                |                          |
+                v                          v
+         monitor_process()          monitor_process()
+                |
+                v
+      +----------------------------+
+      | decode_monitor_results()   |
+      |----------------------------|
+      | ftx_find_candidates()      |
+      | ftx_decode_candidate()     |
+      | parse fields (call_to/de)  |
+      | dedup by text, keep best   |
+      | log_rxtx_line('R',...)     |
+      | auto time-sync (median)    |
+      +-------------+--------------+
+                    |
+                    v
+      +----------------------------+        +----------------------------+
+      | g_rx_lines (top 12)        |        | autoseq engine             |
+      | g_rx_dirty = true          |<-------| autoseq_on_decodes(to_me)  |
+      +-------------+--------------+        | autoseq_on_touch(sel)      |
+                    |                       | autoseq_fetch_pending_tx() |
+                    |                       +-------------+--------------+
+                    |                                     |
+                    v                                     v
+            ui_draw_rx()                         g_qso_xmit = true
+                                                 g_target_slot_parity
+                                                 g_pending_tx_valid + entry
+
+                    |
+                    v
+      +----------------------------+
+      | check_slot_boundary()      |
+      |----------------------------|
+      | detect parity change       |
+      |  if (g_was_txing)          |
+      |     autoseq_tick(...)      |  (pop/advance after TX slot ended)
+      | TX trigger at slot start   |
+      |  if g_qso_xmit && parity   |
+      |     compute actual offset  |
+      |     log_rxtx_line('T',...) |
+      |     tx_start_immediate()   |
+      +-------------+--------------+
+                    |
+                    v
+      +----------------------------+
+      | tx_send_task (core0 task)  |
+      |----------------------------|
+      | encode message -> 79 tones |
+      | CAT: MD6; TX; TAxxxx.xx;   |
+      |  loop 79 tones (160ms)     |
+      |  -> CAT RX;                |
+      | on success:                |
+      |  autoseq_mark_sent(slot)   |
+      |  g_was_txing = true        |
+      |  g_tx_view_dirty = true    |
+      +----------------------------+
+
+
+(2) UI Modes (top-level states)
+
+  ui_mode = { RX, TX, BAND, MENU, HOST(UAC), CONTROL(USB host), DEBUG, LIST, STATUS, QSO }
+
+  enter_mode(new_mode):
+    RX     -> ui_force_redraw_rx(); ui_draw_rx()
+    TX     -> redraw_tx_view()
+    BAND   -> draw_band_view()
+    MENU   -> draw_menu_view() (+ long-edit support)
+    HOST   -> uac_start(); show status lines (updates every 500ms)
+    CONTROL-> show cmd help + start USB prompt
+    QSO    -> list *.adi files -> entries in file
+    STATUS -> beacon/temp edits + date/time edits
+    DEBUG/LIST -> paged list display
+
+
+(3) Host / Control channel (USB serial-jtag + optional BLE UART)
+  +----------------------------+
+  | poll_host_uart()           |
+  |  usb_serial_jtag_read()    |
+  |  -> host_process_bytes()   |
+  +-------------+--------------+
+                |
+                v
+  +----------------------------+
+  | host_process_bytes()       |
+  |----------------------------|
+  | line mode: accumulate text |
+  |  CR/LF -> host_handle_line |
+  | binary mode: WRITEBIN      |
+  |  chunk payload + 4B CRC    |
+  |  writes /spiffs/<file>     |
+  +-------------+--------------+
+                |
+                v
+  +----------------------------+
+  | host_handle_line(cmd)      |
+  |----------------------------|
+  | WRITE/APPEND/READ/DELETE   |
+  | LIST/INFO/HELP/EXIT        |
+  | WRITEBIN <f> <sz> <crc>    |
+  +----------------------------+
+
+(4) Persistence & logs (SPIFFS)
+
+  StationData.ini
+    - bands, band_sel, offset, offset_src, radio, call/grid, ant, comment1,
+      active_bands, skiptx1, rxtx_log, rtc_sleep_epoch, rtc_comp, date/time
+
+  RxTxLog.txt
+    - 'R' lines: timestamp, freq, text, snr, offset
+    - 'T' lines: timestamp, freq, text, offset
+
+  YYYYMMDD.adi
+    - ADIF entries appended via log_adif_entry() callback from autoseq
+
+
+1) UI mode / paging / edit state globals
+ui_mode (UIMode)
+
+Used by:
+
+enter_mode(...) (sets it, mode transitions)
+
+app_task_core0(...) main loop (branches per mode, mode switching keys)
+
+menu_flash_tick(), rx_flash_tick() (conditional redraw based on mode)
+
+rtc_tick() (updates status screen when in STATUS)
+
+draw_menu_view(), draw_status_view(), debug_log_line(...) (conditional redraw)
+
+RX/TX auto switch block in app_task_core0(...) (reads/writes indirectly via enter_mode)
+
+tx_page
+
+Used by:
+
+enter_mode(...) (resets)
+
+redraw_tx_view()
+
+TX key handling inside app_task_core0(...) (pagination ; / ., drop QSO, rotate parity)
+
+band_page, band_edit_idx, band_edit_buffer
+
+Used by:
+
+enter_mode(...) (resets)
+
+draw_band_view() (reads all three)
+
+BAND key handling inside app_task_core0(...) (edit / commit freq / page)
+
+menu_page, menu_edit_idx, menu_edit_buf
+
+Used by:
+
+enter_mode(...) (resets)
+
+draw_menu_view() (reads)
+
+menu_flash_tick() (triggers redraw)
+
+MENU key handling inside app_task_core0(...) (page change, edit begin/commit/cancel)
+
+menu_long_edit, menu_long_kind, menu_long_buf, menu_long_backup
+
+Used by:
+
+draw_menu_view() (branches to draw_menu_long_edit())
+
+draw_menu_long_edit()
+
+MENU key handling inside app_task_core0(...) (long edit capture/commit/cancel)
+
+menu_flash_idx, menu_flash_deadline
+
+Used by:
+
+draw_menu_view() (chooses highlight/flash)
+
+menu_flash_tick() (timeout clears, may redraw)
+
+MENU key handling (sets flash after “Send FreeText”)
+
+rx_flash_idx, rx_flash_deadline
+
+Used by:
+
+RX key handling inside app_task_core0(...) (sets flash when selecting a decode)
+
+rx_flash_tick() (clears + redraw)
+
+RX redraw path in idle section (passes highlight)
+
+g_debug_lines, debug_page, DEBUG_MAX_LINES
+
+Used by:
+
+debug_log_line(...) (push/pop, updates debug_page, redraw if in DEBUG)
+
+DEBUG mode key handling in app_task_core0(...) (page ; / .)
+
+various places that call debug_log_line(...) (boot, decode, host, etc.)
+
+list_page, g_list_lines
+
+Used by:
+
+enter_mode(UIMode::LIST) (resets + draws)
+
+LIST mode key handling in app_task_core0(...) (page ; / .)
+
+QSO list UI: g_q_lines, g_q_files, g_q_show_entries, q_page, g_q_current_file
+
+Used by:
+
+qso_load_file_list() (fills g_q_files, g_q_lines)
+
+qso_load_entries(path) (fills g_q_lines)
+
+enter_mode(UIMode::QSO) (resets state + loads list)
+
+QSO mode key handling in app_task_core0(...) (paging, selecting file, backtick to go back)
+
+STATUS edit UI: status_edit_idx, status_edit_buffer, status_cursor_pos
+
+Used by:
+
+draw_status_view() (shows highlight/edit cursor)
+
+rtc_tick() (suppresses time ticking when editing time; updates display)
+
+enter_mode(...) (resets when leaving STATUS)
+
+STATUS key handling in app_task_core0(...) (edit date/time/cursor movement/commit/cancel)
+
+2) RX decode / TX scheduling / autoseq globals
+g_rx_lines (vector<UiRxLine>)
+
+Used by:
+
+decode_monitor_results(...) (writes it)
+
+RX redraw path in app_task_core0(...) (ui_set_rx_list(g_rx_lines))
+
+RX key handling in app_task_core0(...) (touch selection uses g_rx_lines[sel])
+
+g_rx_dirty
+
+Used by:
+
+decode_monitor_results(..., update_ui=false) (sets g_rx_dirty=true)
+
+idle redraw section in app_task_core0(...) (consumes it)
+
+also checked in c==0 idle branch and later branch
+
+g_tx_view_dirty
+
+Used by:
+
+decode_monitor_results(...) (sets true when autoseq state changes / TX ready)
+
+check_slot_boundary() (sets true when TX finishes via tick)
+
+tx_send_task() (sets true at end)
+
+schedule_tx_if_idle() / schedule_manual_pending_tx() (often implies redraw needed via caller)
+
+TX redraw section in app_task_core0(...) (consumes it)
+
+enter_mode(UIMode::TX) triggers initial redraw_tx_view()
+
+g_auto_switch_to_tx, g_auto_switch_to_rx
+
+Used by:
+
+tx_send_task() (sets g_auto_switch_to_tx=true when TX starts)
+
+decode_monitor_results(...) (sets g_auto_switch_to_rx=true when decodes arrive)
+
+idle section in app_task_core0(...) (does the actual switch via enter_mode(...) and clears flags)
+
+Slot timing globals
+
+g_decode_slot_idx
+
+Used by: decode_monitor_results(...) (to tag slot parity if set; otherwise uses time)
+
+g_last_slot_parity
+
+Used by: check_slot_boundary() (detect boundary)
+
+g_was_txing
+
+Used by: check_slot_boundary() (if was TXing, call autoseq_tick(...) at boundary)
+
+Set by: tx_send_task() (after TX completes successfully)
+
+s_last_tx_slot_idx
+
+Used by: schedule_tx_if_idle(), schedule_manual_pending_tx() (spacing/avoid immediate repeats)
+
+Set by: tx_send_task() (records last TX slot)
+
+TX “armed” flags for slot-boundary trigger
+
+g_qso_xmit
+
+g_target_slot_parity
+Used by:
+
+Set in decode_monitor_results(...) when autoseq_fetch_pending_tx(...) returns true
+
+Set also in RX key handling when user touches a decode (autoseq_on_touch(...) then fetch pending)
+
+Set in STATUS mode when beacon turned on (inside enter_mode(...) exit logic)
+
+Read/cleared in check_slot_boundary() (starts TX when parity matches, early in slot)
+
+Pending TX descriptor
+
+g_pending_tx / g_pending_tx_valid
+Used by:
+
+decode_monitor_results(...) (writes both)
+
+check_slot_boundary() (uses it to compute/force actual offset + logs TX line)
+
+redraw_tx_view() (uses scheduled line if valid)
+
+encode_and_log_pending_tx() (encodes current pending)
+
+tx_start_immediate() (starts immediate task using current pending)
+
+tx_send_task() (uses ctx->e, but also checks/clears globals on cancel/end)
+
+schedule_tx_if_idle(), schedule_manual_pending_tx() (writes)
+
+TX UI key handlers (drop/rotate triggers refetch and updates pending)
+
+TX cancel
+
+g_tx_cancel_requested
+Used by:
+
+main loop global handler for '`' (sets it, sends CAT RX;)
+
+tx_send_task() (checks during delay + during tone loop)
+
+cleared by tx_send_task() at end and by early-exit cancel path
+
+TX task handle / locking
+
+s_tx_task_handle
+
+mux
+Used by:
+
+schedule_tx_if_idle(), schedule_manual_pending_tx(), tx_start_immediate() (critical sections around handle)
+
+tx_send_task() (clears handle on exit paths)
+
+check_slot_boundary() checks s_tx_task_handle==NULL before starting TX
+
+g_last_reply_text
+
+Used by:
+
+decode_monitor_results(...) (sets to first “to_me” decode text)
+(If used elsewhere, it’s not in the visible snippet.)
+
+g_streaming
+
+Declared but (in the pasted portion) not meaningfully used (UAC uses uac_is_streaming()).
+
+3) Station/config globals (band, CQ, offsets, radio, logging)
+Bands / selection
+
+g_bands
+
+g_band_sel
+Used by:
+
+draw_band_view() (reads)
+
+advance_active_band(...) (reads/writes g_band_sel)
+
+rebuild_active_bands() (may force g_band_sel valid)
+
+log_rxtx_line(...) (band->freq MHz)
+
+log_adif_entry(...) (band->freq MHz)
+
+STATUS view / tuning / CAT sync blocks in app_task_core0(...)
+
+load_station_data() / save_station_data()
+
+Active band list
+
+g_active_band_text
+
+g_active_band_indices
+Used by:
+
+rebuild_active_bands() (parses text→indices, normalizes text, may adjust g_band_sel)
+
+advance_active_band(...) (uses indices to step)
+
+draw_menu_view() (displays)
+
+load_station_data() / save_station_data()
+
+MENU long-edit handler (page 2 “ActiveBand”)
+
+Beacon / tune
+
+g_beacon
+
+g_status_beacon_temp
+
+g_tune
+Used by:
+
+draw_status_view() (shows beacon/tune)
+
+STATUS key handling in app_task_core0(...) (toggle beacon temp, tune CAT TX/RX)
+
+enter_mode(...) (when leaving STATUS, commits beacon temp to g_beacon and may enqueue beacon CQ)
+
+decode_monitor_results(...) (if no TX ready and beacon enabled → enqueue_beacon_cq())
+
+enqueue_beacon_cq() (reads beacon to pick parity)
+
+Offsets
+
+g_offset_hz
+
+g_offset_src
+Used by:
+
+draw_menu_view() / status editing
+
+schedule_manual_pending_tx() (initial offset; actual offset may be recomputed later)
+
+check_slot_boundary() (computes actual TX offset based on src + pending + randomness)
+
+STATUS key handling (edit offset via ; . , /)
+
+load_station_data() / save_station_data()
+
+CQ / FreeText / station identity
+
+g_cq_type
+
+g_cq_freetext
+
+g_free_text
+
+g_call
+
+g_grid
+Used by:
+
+update_autoseq_cq_type() (maps into autoseq + uses FreeText string)
+
+load_station_data() / save_station_data()
+
+decode_monitor_results(...) (compares to-me vs g_call)
+
+enter_mode(...) boot flow: autoseq_set_station(g_call, g_grid)
+
+draw_menu_view(), draw_status_view()
+
+MENU key handling (cycle CQ type, edit call/grid, edit freetext, send freetext)
+
+Radio / antenna / comment
+
+g_radio
+
+g_ant
+
+g_comment1
+Used by:
+
+radio_name(...), expand_comment1()
+
+draw_status_view(), draw_menu_view()
+
+STATUS key handling (CAT sync)
+
+log_adif_entry(...) expands /Radio and /Ant
+
+load_station_data() / save_station_data()
+
+Logging toggles
+
+g_rxtx_log
+Used by:
+
+log_rxtx_line(...) (early return)
+
+MENU page 2 toggle
+
+load_station_data() / save_station_data()
+
+g_skip_tx1
+
+Used by:
+
+MENU page 2 toggle
+
+load_station_data() / save_station_data()
+(If it affects autoseq behavior, that’s likely inside autoseq.*, not shown here.)
+
+4) RTC / timekeeping globals
+Soft RTC core
+
+rtc_epoch_base, rtc_ms_start, rtc_last_update, rtc_valid
+Used by:
+
+rtc_set_from_strings()
+
+rtc_init_from_hw()
+
+rtc_sync_to_hw()
+
+rtc_update_strings()
+
+rtc_now_ms()
+
+rtc_tick()
+
+Persisted sleep compensation
+
+g_rtc_sleep_epoch
+
+g_rtc_comp
+Used by:
+
+rtc_init_from_hw() (applies compensation and clears one-shot epoch)
+
+MENU page 2 edit (RTC Comp)
+
+deep sleep entry in MENU (saves epoch, syncs HW RTC, saves station data)
+
+load_station_data() / save_station_data()
+
+Time strings shown/edited
+
+g_date, g_time
+Used by:
+
+rtc_set_from_strings(), rtc_init_from_hw(), rtc_update_strings()
+
+rtc_tick() (refresh strings + draw)
+
+draw_status_view()
+
+STATUS edit handling (commit new date/time)
+
+Slot/countdown uses time
+
+Used by:
+
+update_countdown() (calls rtc_now_ms())
+
+check_slot_boundary() (calls rtc_now_ms())
+
+menu_flash_tick(), rx_flash_tick() (uses rtc_now_ms())
+
+5) Host / CONTROL mode / USB serial + binary upload globals
+USB ready + prompt
+
+usb_ready
+
+HOST_PROMPT
+Used by:
+
+ensure_usb()
+
+host_write_str(...)
+
+poll_host_uart()
+
+enter_mode(UIMode::CONTROL) (writes READY + prompt if USB ok)
+
+host_handle_line(...), host_process_bytes(...) (prompts)
+
+Line input buffer
+
+host_input
+Used by:
+
+host_process_bytes(...) (accumulates chars, calls host_handle_line(...))
+
+Binary upload state
+
+host_bin_active
+
+host_bin_remaining
+
+host_bin_fp
+
+host_bin_crc
+
+host_bin_expected_crc
+
+host_bin_received
+
+host_bin_buf
+
+HOST_BIN_CHUNK
+
+host_bin_chunk_expect
+
+host_bin_first8, host_bin_last8, host_bin_first_filled
+
+host_bin_path
+Used by:
+
+host_handle_line(...) (handles WRITEBIN, opens file, initializes all state)
+
+host_process_bytes(...) (core state machine: chunk buffering, crc verify, write, ACK, finalize)
+
+CONTROL loop in app_task_core0(...) (blocks exit while host_bin_active)
+
+Helpers for host protocol
+
+Used by host functions:
+
+parse_crc_hex(...)
+
+crc32_update(...)
+
+host_debug_hex8(...)
+
+trim_copy(...)
+
+6) Soft UART log redirect globals
+
+SOFT_UART_NUM, SOFT_UART_TX_PIN, SOFT_UART_RX_PIN
+Used by:
+
+init_soft_uart()
+
+soft_uart_vprintf(...) (writes to UART)
+
+set_log_to_soft_uart(...) (install vprintf hook)
+
+Mode switching keys (HOST/CONTROL toggles log redirect via set_log_to_soft_uart(...))
+
+s_prev_vprintf, s_log_soft_uart
+Used by:
+
+set_log_to_soft_uart(...)
+
+soft_uart_vprintf(...) (indirectly via hook install)
+
+7) UAC / audio host globals
+
+g_uac_lines
+Used by:
+
+enter_mode(UIMode::HOST) (initializes lines)
+
+HOST-mode loop in app_task_core0(...) (updates lines periodically, draws list)
+
+g_decode_enabled
+Used by:
+
+enter_mode(UIMode::HOST) (sets true on start)
+
+HOST/STATUS loop logic in app_task_core0(...) (ensures decode enabled if streaming)
+
+STATUS “connect/sync” handler toggles UAC start and sets decode enabled
+
+(Actual streaming state is via uac_is_streaming(); g_streaming isn’t used meaningfully in the visible code.)
+
+8) Misc globals
+
+log_mutex
+Used by:
+
+created in app_task_core0(...)
+
+log_rxtx_line(...) (protects file append)
+
+STATION_FILE
+Used by:
+
+load_station_data()
+
+save_station_data()
+
+g_ctrl_lines
+Used by:
+
+enter_mode(UIMode::CONTROL) (draw list)
+
+host_handle_line("HELP") (prints lines)
+
+g_uac_lines / g_ctrl_lines / g_list_lines are all “UI list content” vectors used by their respective draw/enter loops.
+
+9) BLE-only globals (only when ENABLE_BLE is 1)
+
+ble_rx_queue
+Used by: uart_rx_cb(...) (push bytes), poll_ble_uart() (drains), init_bluetooth() (creates)
+
+gatt_tx_handle, g_conn_handle
+Used by: host_send_bt(...) (notify), gap_cb(...) (set/clear conn), service table init
+
+g_own_addr_type
+Used by: ble_on_sync(), ble_app_advertise()
+
+BT_TAG
+Used by: logging in BLE functions
+
+BLE functions that touch these:
+
+init_bluetooth(), gap_cb(...), ble_on_sync(), ble_app_advertise(), nimble_host_task(...),
+
+uart_rx_cb(...), uart_tx_cb(...), poll_ble_uart(), host_send_bt(...)
+
+
