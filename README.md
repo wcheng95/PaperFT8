@@ -2,6 +2,6 @@ Join [https://groups.io/g/qrp-portable](https://groups.io/g/qrp-portable) for an
 
 PaperFT8 is ported from [Mini-FT8](https://github.com/wcheng95/Mini-FT8) (Work in progress)
 
-![M5PaperS3](M5PaperS3.png)
+![M5PaperS3](PaperFT8.jpeg)
 
 73, Wei AG6AQ
