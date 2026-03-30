@@ -663,25 +663,25 @@ bool hashtable_lookup(ftx_callsign_hash_type_t hash_type, uint32_t hash, char* c
                                                    ((hash >> 12) & 0x03FFu);
 
     int idx = (hash10 * 23) % CALLSIGN_HASHTABLE_SIZE;
-    int start_idx = idx;
-
-    // Linear probing: must match add()
-    while (callsign_hashtable[idx].callsign[0] != '\0')
+    // Important: entries can be deleted by hashtable_trim_size(), which creates
+    // empty holes in probe chains. Stopping at the first empty slot can miss
+    // valid entries that were inserted later in that chain. Scan the full table.
+    for (int probe = 0; probe < CALLSIGN_HASHTABLE_SIZE; ++probe)
     {
-        uint32_t existing_hash = callsign_hashtable[idx].hash & 0x003FFFFFu;
+        int scan_idx = (idx + probe) % CALLSIGN_HASHTABLE_SIZE;
+        if (callsign_hashtable[scan_idx].callsign[0] == '\0')
+            continue;
+
+        uint32_t existing_hash = callsign_hashtable[scan_idx].hash & 0x003FFFFFu;
 
         if ((existing_hash >> hash_shift) == hash)
         {
-            strcpy(callsign, callsign_hashtable[idx].callsign);
+            strcpy(callsign, callsign_hashtable[scan_idx].callsign);
 
-            // Reset age to 0 on successful hit, preserve 22-bit payload
-            callsign_hashtable[idx].hash = existing_hash;
+            // Reset age to 0 on successful hit, preserve 22-bit payload.
+            callsign_hashtable[scan_idx].hash = existing_hash;
             return true;
         }
-
-        idx = (idx + 1) % CALLSIGN_HASHTABLE_SIZE;
-        if (idx == start_idx)
-            break;
     }
 
     callsign[0] = '\0';
@@ -734,8 +734,6 @@ static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static std::vector<UiRxLine> g_rx_lines;
 static volatile bool g_tx_view_dirty = false;  // Set when autoseq state changes
-static volatile bool g_auto_switch_to_tx = false;  // Auto-switch to TX screen when transmitting
-static volatile bool g_auto_switch_to_rx = false;  // Auto-switch to RX screen when decodes arrive
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 
 // State machine variables (matching reference project architecture)
@@ -2436,11 +2434,8 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   merged.insert(merged.end(), to_me.begin(), to_me.end());
   merged.insert(merged.end(), cqs.begin(), cqs.end());
   merged.insert(merged.end(), others.begin(), others.end());
-  if (merged.size() > 12) merged.resize(12);
 
   g_rx_lines = merged;
-
-  if (!merged.empty()) g_auto_switch_to_rx = true;
 
   if (update_ui) {
     ui_set_rx_list(g_rx_lines);
@@ -3022,9 +3017,6 @@ static void tx_start(int skip_tones) {
     cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
     cat_cdc_send(reinterpret_cast<const uint8_t*>(tx), strlen(tx), 200);
   }
-
-  // Auto-switch to TX screen when transmission starts
-  g_auto_switch_to_tx = true;
 
   if (skip_tones > 0) {
     ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", skip_tones);
@@ -4115,24 +4107,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
 
     if (c == 0) {
-      // Auto-switch between RX and TX screens (only when in RX or TX mode)
-      if (g_auto_switch_to_tx && ui_mode == UIMode::RX) {
-        g_auto_switch_to_tx = false;
-        g_auto_switch_to_rx = false;  // Clear both to avoid ping-pong
-        enter_mode(UIMode::TX);
-        redraw_tx_view();
-      } else if (g_auto_switch_to_rx && ui_mode == UIMode::TX) {
-        g_auto_switch_to_rx = false;
-        g_auto_switch_to_tx = false;
-        enter_mode(UIMode::RX);
-        ui_force_redraw_rx();
-        ui_draw_rx();
-      } else {
-        // Clear flags if in other modes (don't interrupt MENU, BAND, etc.)
-        g_auto_switch_to_tx = false;
-        g_auto_switch_to_rx = false;
-      }
-
       if (g_rx_dirty && ui_mode == UIMode::RX) {
         ui_set_rx_list(g_rx_lines);
         ui_draw_rx(rx_flash_idx);

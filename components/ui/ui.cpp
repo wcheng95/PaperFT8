@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 static constexpr int RX_LINES = 6;
 
@@ -37,6 +38,8 @@ static std::vector<UiRxLine> last_drawn_lines;
 static int last_page = -1;
 
 static SemaphoreHandle_t g_disp_mutex = nullptr;
+static TaskHandle_t g_disp_task = nullptr;
+static volatile bool g_display_pending = false;
 
 static void disp_lock() {
     if (g_disp_mutex) {
@@ -54,6 +57,26 @@ struct DispGuard {
     DispGuard() { disp_lock(); }
     ~DispGuard() { disp_unlock(); }
 };
+
+static void request_display_flush() {
+    if (!g_disp_task) {
+        M5.Display.display();
+        return;
+    }
+    g_display_pending = true;
+    xTaskNotifyGive(g_disp_task);
+}
+
+static void ui_display_task(void*) {
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        while (g_display_pending) {
+            g_display_pending = false;
+            DispGuard guard;
+            M5.Display.display();
+        }
+    }
+}
 
 static int line_y(int line_idx) {
     return g_y_offset + line_idx * kLineHeightPx;
@@ -123,6 +146,10 @@ void ui_draw_waterfall_if_dirty() {}
 
 void ui_init() {
     g_disp_mutex = xSemaphoreCreateMutex();
+    BaseType_t ret = xTaskCreatePinnedToCore(ui_display_task, "ui_display", 3072, nullptr, 1, &g_disp_task, 0);
+    if (ret != pdPASS) {
+        g_disp_task = nullptr;
+    }
 
     auto cfg = M5.config();
     cfg.output_power = true;
@@ -151,7 +178,7 @@ void ui_init() {
         draw_text_row(i, "", false);
     }
     draw_command_bar_locked();
-    M5.Display.display();
+    request_display_flush();
 }
 
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
@@ -221,7 +248,7 @@ void ui_draw_rx(int flash_index) {
             draw_text_row(i, "", false);
         }
     }
-    M5.Display.display();
+    request_display_flush();
 
     if (flash_index < 0) {
         last_page = rx_page;
@@ -273,7 +300,7 @@ void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight
         }
     }
 
-    M5.Display.display();
+    request_display_flush();
 }
 
 void ui_draw_debug(const std::vector<std::string>& lines, int page) {
@@ -288,13 +315,13 @@ void ui_draw_debug(const std::vector<std::string>& lines, int page) {
         }
     }
 
-    M5.Display.display();
+    request_display_flush();
 }
 
 void ui_draw_mode_box(const char* mode_label) {
     DispGuard guard;
     draw_mode_row(mode_label ? mode_label : "");
-    M5.Display.display();
+    request_display_flush();
 }
 
 int ui_command_hit_test(int x, int y) {
@@ -306,7 +333,7 @@ int ui_command_hit_test(int x, int y) {
 void ui_draw_command_bar() {
     DispGuard guard;
     draw_command_bar_locked();
-    M5.Display.display();
+    request_display_flush();
 }
 
 void ui_draw_tx(const std::string& next,
@@ -339,7 +366,7 @@ void ui_draw_tx(const std::string& next,
         }
     }
 
-    M5.Display.display();
+    request_display_flush();
 }
 
 int ui_rx_hit_test(int x, int y) {
@@ -371,3 +398,4 @@ void ui_rx_scroll(int delta) {
         }
     }
 }
+
