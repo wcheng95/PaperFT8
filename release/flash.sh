@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bash helper to flash Mini-FT8 merged firmware image on Linux (ESP32-S3, 8MB)
+# Bash helper to flash PaperFT8 merged firmware image on Linux (ESP32-S3, 8MB)
 # Usage:
 #   1) Install esptool (recommended):
 #        sudo apt install -y pipx
@@ -44,7 +44,7 @@ echo "Tip: if permissions fail, run: sudo usermod -aG dialout \$USER  (then log 
 echo ""
 
 PORT="$(require_nonempty "Enter serial port (e.g., /dev/ttyACM0 or /dev/ttyUSB0): ")"
-BIN_IN="$(require_nonempty "Enter merged firmware .bin path (e.g., MiniFT8_V1.3.2.bin): ")"
+BIN_IN="$(require_nonempty "Enter merged firmware .bin path (e.g., PaperFT8_V1.4.1.bin): ")"
 
 if [[ ! -f "$BIN_IN" ]]; then
   echo "ERROR: File not found: $BIN_IN" >&2

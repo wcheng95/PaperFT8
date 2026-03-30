@@ -1,4 +1,4 @@
-# Flash Mini-FT8 merged firmware image (ESP32-S3, 8MB)
+# Flash PaperFT8 merged firmware image (ESP32-S3, 8MB)
 # Requires: pip install esptool
 # Usage: .\flash.ps1
 
@@ -22,11 +22,11 @@ function Resolve-ExistingPath([string]$Path) {
 $Chip = "esp32s3"
 $Baud = 460800
 
-Write-Host "Mini-FT8 flasher (merged .bin)" -ForegroundColor Cyan
+Write-Host "PaperFT8 flasher (merged .bin)" -ForegroundColor Cyan
 Write-Host ""
 
 $PortIn = Require-NonEmpty "Enter serial port (e.g., COM11)"
-$BinIn  = Require-NonEmpty "Enter merged firmware .bin path (e.g., MiniFT8_V1.3.2.bin)"
+$BinIn  = Require-NonEmpty "Enter merged firmware .bin path (e.g., PaperFT8_V1.4.1.bin)"
 
 $Port = $PortIn.Trim()
 $Bin  = Resolve-ExistingPath $BinIn.Trim()
