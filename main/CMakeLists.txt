@@ -8,6 +8,7 @@ idf_component_register(
     REQUIRES
         M5Unified
         M5GFX
+        touch_keyboard
         ui
         ft8_lib
         spiffs

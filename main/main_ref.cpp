@@ -14,6 +14,7 @@ extern "C" {
   }
 
 #include "ui.h"
+#include "TouchKeyboard.h"
 #include <vector>
 #include <string>
 #include "freertos/FreeRTOS.h"
@@ -858,7 +859,6 @@ struct GestureEvent {
   int command_idx = -1;
 };
 static bool g_touch_key12_toggle = false;
-static constexpr int kTouchKbdCols = 10;
 static std::vector<std::string> g_q_lines;
 static std::vector<std::string> g_q_files;
 static bool g_q_show_entries = false;
@@ -935,6 +935,11 @@ static int64_t menu_flash_deadline = 0;  // ms timestamp when flash ends
 static bool menu_delete_confirm = false;  // confirmation state for Delete Logs
 static int rx_flash_idx = -1;
 static int64_t rx_flash_deadline = 0;
+enum class TouchKbdEditTarget { None, MenuLong, MenuEdit, StatusDate, StatusTime };
+static TouchKbdEditTarget g_touchkbd_target = TouchKbdEditTarget::None;
+static std::string g_touchkbd_header;
+static char g_touchkbd_buffer[256] = {0};
+static bool g_touchkbd_needs_display = false;
 bool g_streaming = false;
 static void draw_menu_view();
 static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging);
@@ -942,8 +947,8 @@ static void draw_status_view();
 static void draw_status_line(int idx, const std::string& text, bool highlight);
 static void draw_touch_keyboard_overlay(const std::string& header);
 static bool touch_keyboard_active();
-static char touch_keyboard_char_from_tap(int x, int line_idx);
-static char touch_keyboard_command_to_key(int command_idx);
+static void touch_keyboard_process_touch();
+static void touch_keyboard_end_session();
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 static void update_countdown();
 static void menu_flash_tick();
@@ -2487,48 +2492,355 @@ static bool touch_keyboard_active() {
   return false;
 }
 
+static void touch_keyboard_apply_buffer_shadow();
+static void touch_keyboard_commit_current();
+static void touch_keyboard_cancel_current();
+static void touch_keyboard_draw_edit_window();
+
+class TouchKeyboardHost final : public touchkbd::IHost {
+ public:
+  uint32_t nowMs() const override {
+    return static_cast<uint32_t>(rtc_now_ms() & 0xFFFFFFFFu);
+  }
+
+  void onBufferChanged(const touchkbd::BufferState&) override {
+    touch_keyboard_apply_buffer_shadow();
+    touch_keyboard_draw_edit_window();
+  }
+
+  void onCommit(const touchkbd::BufferState&) override {
+    touch_keyboard_commit_current();
+  }
+
+  void onCancel(const touchkbd::BufferState&) override {
+    touch_keyboard_cancel_current();
+  }
+};
+
+class TouchKeyboardRenderer final : public touchkbd::IRenderer {
+ public:
+  void drawKeyboardBackground(const touchkbd::Rect& bounds) override {
+    M5.Display.fillRect(bounds.x, bounds.y, bounds.w, bounds.h, TFT_WHITE);
+
+    const int row_h = std::max<int16_t>(1, bounds.h / 4);
+    for (int row = 0; row < 4; ++row) {
+      const int y = bounds.y + row * row_h;
+      M5.Display.drawFastHLine(bounds.x, y, bounds.w, TFT_BLACK);
+      M5.Display.drawFastHLine(bounds.x, y + row_h - 1, bounds.w, TFT_BLACK);
+    }
+
+    touch_keyboard_draw_edit_window();
+    g_touchkbd_needs_display = true;
+  }
+
+  void drawKey(const touchkbd::KeyDef& key, const touchkbd::KeyVisualState& state) override {
+    constexpr int16_t kPadX = 3;
+    constexpr int16_t kPadY = 3;
+
+    int16_t x = key.rect.x + kPadX;
+    int16_t y = key.rect.y + kPadY;
+    int16_t w = key.rect.w - 2 * kPadX;
+    int16_t h = key.rect.h - 2 * kPadY;
+    if (w <= 0 || h <= 0) return;
+
+    const uint16_t bg = state.pressed ? TFT_BLACK : TFT_WHITE;
+    const uint16_t fg = state.pressed ? TFT_WHITE : TFT_BLACK;
+
+    M5.Display.fillRect(x, y, w, h, bg);
+    M5.Display.drawRect(x, y, w, h, TFT_BLACK);
+    M5.Display.setTextColor(fg, bg);
+    M5.Display.setTextDatum(middle_center);
+
+    const size_t label_len = (key.label != nullptr) ? strlen(key.label) : 0;
+    int text_size = (label_len >= 4) ? 2 : 3;
+    if (label_len >= 6) text_size = 1;
+    M5.Display.setTextSize(text_size);
+    M5.Display.drawString((key.label != nullptr) ? key.label : "", x + (w / 2), y + (h / 2));
+
+    g_touchkbd_needs_display = true;
+  }
+};
+
+static TouchKeyboardHost& touch_keyboard_host() {
+  static TouchKeyboardHost host;
+  return host;
+}
+
+static TouchKeyboardRenderer& touch_keyboard_renderer() {
+  static TouchKeyboardRenderer renderer;
+  return renderer;
+}
+
+static touchkbd::TouchKeyboard& touch_keyboard_instance() {
+  static touchkbd::Config cfg;
+  static touchkbd::TouchKeyboard keyboard(touch_keyboard_host(), &touch_keyboard_renderer(), cfg);
+  return keyboard;
+}
+
+static void touch_keyboard_set_bounds() {
+  const UiLayout& lay = ui_layout();
+  touch_keyboard_instance().setBounds(
+      static_cast<int16_t>(lay.text_area.x),
+      static_cast<int16_t>(lay.text_area.y + (2 * lay.line_h)),
+      static_cast<int16_t>(lay.text_area.w),
+      static_cast<int16_t>(4 * lay.line_h));
+}
+
+static void touch_keyboard_apply_buffer_shadow() {
+  const std::string text(g_touchkbd_buffer);
+
+  switch (g_touchkbd_target) {
+    case TouchKbdEditTarget::MenuLong:
+      menu_long_buf = text;
+      break;
+    case TouchKbdEditTarget::MenuEdit:
+      menu_edit_buf = text;
+      break;
+    case TouchKbdEditTarget::StatusDate:
+    case TouchKbdEditTarget::StatusTime:
+      status_edit_buffer = text;
+      break;
+    case TouchKbdEditTarget::None:
+      break;
+  }
+}
+
+static void touch_keyboard_end_session() {
+  touch_keyboard_instance().detachBuffer();
+  g_touchkbd_target = TouchKbdEditTarget::None;
+  g_touchkbd_header.clear();
+  g_touchkbd_buffer[0] = '\0';
+  g_touchkbd_needs_display = false;
+}
+
+static void touch_keyboard_draw_edit_window() {
+  const UiLayout& lay = ui_layout();
+  const int row_h = lay.line_h;
+  const int x = lay.text_area.x;
+  const int y = lay.text_area.y;
+
+  M5.Display.fillRect(x, y, lay.text_area.w, row_h * 2, TFT_WHITE);
+
+  for (int row = 0; row < 2; ++row) {
+    const int row_y = y + row * row_h;
+    M5.Display.drawFastHLine(x, row_y, lay.text_area.w, TFT_BLACK);
+    M5.Display.drawFastHLine(x, row_y + row_h - 1, lay.text_area.w, TFT_BLACK);
+  }
+
+  const touchkbd::VisibleLines visible = touch_keyboard_instance().getVisibleLines();
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.setTextSize(4);
+  M5.Display.drawString(visible.lines[0].data(), x + 24, y + (row_h / 2));
+  M5.Display.drawString(visible.lines[1].data(), x + 24, y + row_h + (row_h / 2));
+
+  if (visible.cursorVisible && visible.cursorLine < 2) {
+    const int text_left = x + 24;
+    const int text_right = x + lay.text_area.w - 24;
+    const int text_w = std::max(1, text_right - text_left);
+    const int cell_w = std::max(1, text_w / static_cast<int>(touchkbd::VisibleLines::kCols));
+    const int cursor_x = text_left + static_cast<int>(visible.cursorCol) * cell_w;
+    const int cursor_y = y + static_cast<int>(visible.cursorLine) * row_h;
+    M5.Display.drawFastVLine(cursor_x, cursor_y + 10, row_h - 20, TFT_BLACK);
+  }
+
+  g_touchkbd_needs_display = true;
+}
+
+static void touch_keyboard_begin_session(TouchKbdEditTarget target,
+                                         const std::string& initial_text,
+                                         const std::string& header) {
+  if (g_touchkbd_target == target && touch_keyboard_instance().isEditing()) {
+    g_touchkbd_header = header;
+    return;
+  }
+
+  touch_keyboard_end_session();
+
+  size_t copy_len = std::min(initial_text.size(), sizeof(g_touchkbd_buffer) - 1);
+  memcpy(g_touchkbd_buffer, initial_text.data(), copy_len);
+  g_touchkbd_buffer[copy_len] = '\0';
+
+  g_touchkbd_target = target;
+  g_touchkbd_header = header;
+
+  touch_keyboard_set_bounds();
+  if (!touch_keyboard_instance().attachBuffer(g_touchkbd_buffer, sizeof(g_touchkbd_buffer))) {
+    g_touchkbd_target = TouchKbdEditTarget::None;
+    return;
+  }
+
+  touch_keyboard_apply_buffer_shadow();
+}
+
+static void touch_keyboard_commit_current() {
+  touch_keyboard_apply_buffer_shadow();
+
+  switch (g_touchkbd_target) {
+    case TouchKbdEditTarget::MenuLong: {
+      if (menu_long_kind == LONG_FT) {
+        g_free_text = menu_long_buf;
+        if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
+        update_autoseq_cq_type();
+      } else if (menu_long_kind == LONG_COMMENT) {
+        g_comment1 = menu_long_buf;
+      } else if (menu_long_kind == LONG_ACTIVE) {
+        g_active_band_text = menu_long_buf;
+        rebuild_active_bands();
+      }
+      save_station_data();
+      menu_long_edit = false;
+      menu_long_kind = LONG_NONE;
+      menu_long_buf.clear();
+      menu_long_backup.clear();
+      touch_keyboard_end_session();
+      draw_menu_view();
+      break;
+    }
+    case TouchKbdEditTarget::MenuEdit: {
+      if (menu_edit_idx == 3) {
+        g_call = menu_edit_buf;
+        autoseq_set_station(g_call, g_grid);
+      } else if (menu_edit_idx == 4) {
+        g_grid = menu_edit_buf;
+        autoseq_set_station(g_call, g_grid);
+      } else if (menu_edit_idx == 7) {
+        g_offset_hz = atoi(menu_edit_buf.c_str());
+      } else if (menu_edit_idx == 9) {
+        g_ant = menu_edit_buf;
+      } else if (menu_edit_idx == 10) {
+        g_comment1 = menu_edit_buf;
+      } else if (menu_edit_idx == 15) {
+        g_rtc_comp = atoi(menu_edit_buf.c_str());
+      }
+      save_station_data();
+      menu_edit_idx = -1;
+      menu_edit_buf.clear();
+      touch_keyboard_end_session();
+      draw_menu_view();
+      break;
+    }
+    case TouchKbdEditTarget::StatusDate:
+    case TouchKbdEditTarget::StatusTime: {
+      if (g_touchkbd_target == TouchKbdEditTarget::StatusDate) g_date = status_edit_buffer;
+      else g_time = status_edit_buffer;
+      save_station_data();
+      rtc_set_from_strings();
+      rtc_sync_to_hw();
+      status_edit_idx = -1;
+      status_cursor_pos = -1;
+      status_edit_buffer.clear();
+      touch_keyboard_end_session();
+      draw_status_view();
+      break;
+    }
+    case TouchKbdEditTarget::None:
+      break;
+  }
+}
+
+static void touch_keyboard_cancel_current() {
+  switch (g_touchkbd_target) {
+    case TouchKbdEditTarget::MenuLong:
+      menu_long_edit = false;
+      menu_long_kind = LONG_NONE;
+      menu_long_buf.clear();
+      menu_long_backup.clear();
+      touch_keyboard_end_session();
+      draw_menu_view();
+      break;
+    case TouchKbdEditTarget::MenuEdit:
+      menu_edit_idx = -1;
+      menu_edit_buf.clear();
+      touch_keyboard_end_session();
+      draw_menu_view();
+      break;
+    case TouchKbdEditTarget::StatusDate:
+    case TouchKbdEditTarget::StatusTime:
+      status_edit_idx = -1;
+      status_cursor_pos = -1;
+      status_edit_buffer.clear();
+      touch_keyboard_end_session();
+      draw_status_view();
+      break;
+    case TouchKbdEditTarget::None:
+      break;
+  }
+}
+
 static void draw_touch_keyboard_overlay(const std::string& header) {
-  std::vector<std::string> lines;
-  lines.reserve(6);
-  lines.push_back(head_trim(header, 22));
-  lines.push_back("1 2 3 4 5 6 7 8 9 0");
-  lines.push_back("Q W E R T Y U I O P");
-  lines.push_back("A S D F G H J K L -");
-  lines.push_back("Z X C V B N M / . _");
-  lines.push_back("_ @ ? : , + ; ( ) '");
-  ui_draw_list(lines, 0, -1);
+  TouchKbdEditTarget target = TouchKbdEditTarget::None;
+  std::string initial_text;
+
+  if (ui_mode == UIMode::MENU) {
+    if (menu_long_edit) {
+      target = TouchKbdEditTarget::MenuLong;
+      initial_text = menu_long_buf;
+    } else if (menu_edit_idx >= 0) {
+      target = TouchKbdEditTarget::MenuEdit;
+      initial_text = menu_edit_buf;
+    }
+  } else if (ui_mode == UIMode::STATUS) {
+    if (status_edit_idx == 4) {
+      target = TouchKbdEditTarget::StatusDate;
+      initial_text = status_edit_buffer;
+    } else if (status_edit_idx == 5) {
+      target = TouchKbdEditTarget::StatusTime;
+      initial_text = status_edit_buffer;
+    }
+  }
+
+  if (target == TouchKbdEditTarget::None) {
+    touch_keyboard_end_session();
+    return;
+  }
+
+  touch_keyboard_begin_session(target, initial_text, header);
+  touch_keyboard_set_bounds();
+
+  g_touchkbd_header = header;
+  std::string mode_line = std::string("K: ") + head_trim(g_touchkbd_header, 26);
+  ui_draw_mode_box(mode_line.c_str());
+
+  touch_keyboard_instance().drawAll();
+  touch_keyboard_draw_edit_window();
+  if (g_touchkbd_needs_display) {
+    M5.Display.display();
+    g_touchkbd_needs_display = false;
+  }
 }
 
-static char touch_keyboard_char_from_tap(int x, int line_idx) {
-  if (line_idx <= 0 || line_idx > 5) return 0;
+static void touch_keyboard_process_touch() {
+  if (!touch_keyboard_active()) return;
+  if (g_touchkbd_target == TouchKbdEditTarget::None) return;
+  if (!touch_keyboard_instance().isEditing()) return;
 
-  static const char* rows[] = {
-    "1234567890",
-    "QWERTYUIOP",
-    "ASDFGHJKL-",
-    "ZXCVBNM/._",
-    "_@?:,+;()'",
-  };
+  auto d = M5.Touch.getDetail();
+  if (d.wasPressed()) {
+    touch_keyboard_instance().onTouchDown(d.x, d.y);
+  } else if (d.isPressed()) {
+    touch_keyboard_instance().onTouchMove(d.x, d.y);
+  }
+  if (d.wasReleased()) {
+    touch_keyboard_instance().onTouchUp(d.x, d.y);
+    if (!touch_keyboard_active() ||
+        g_touchkbd_target == TouchKbdEditTarget::None ||
+        !touch_keyboard_instance().isEditing()) {
+      return;
+    }
+  }
 
-  int w = ui_layout().screen_w;
-  if (w <= 0) w = 1;
-  int col = (x * kTouchKbdCols) / w;
-  if (col < 0) col = 0;
-  if (col >= kTouchKbdCols) col = kTouchKbdCols - 1;
+  touch_keyboard_instance().tick();
+  if (!touch_keyboard_active() ||
+      g_touchkbd_target == TouchKbdEditTarget::None ||
+      !touch_keyboard_instance().isEditing()) {
+    return;
+  }
+  touch_keyboard_instance().redrawDirty();
 
-  char ch = rows[line_idx - 1][col];
-  return (ch == '_') ? ' ' : ch;
-}
-
-static char touch_keyboard_command_to_key(int command_idx) {
-  switch (command_idx) {
-    case 0: return '\n';  // 12 => OK
-    case 1: return '`';   // ESC
-    case 7: return 0x08;  // B => backspace
-    case 8: return ' ';   // C => space
-    case 10: return ',';  // ^ => left
-    case 11: return '/';  // v => right
-    default: return 0;
+  if (g_touchkbd_needs_display) {
+    M5.Display.display();
+    g_touchkbd_needs_display = false;
   }
 }
 
@@ -3648,26 +3960,23 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   while (true) {
     M5.update();
     char c = 0;
-    GestureEvent ge;
-    if (poll_gesture(ge)) {
+    if (!touch_keyboard_active() && g_touchkbd_target != TouchKbdEditTarget::None) {
+      touch_keyboard_end_session();
+    }
+
+    GestureEvent ge{};
+    if (touch_keyboard_active()) {
+      touch_keyboard_process_touch();
+    } else if (poll_gesture(ge)) {
       if (ge.action == GestureAction::TapCommand) {
-        if (touch_keyboard_active()) {
-          c = touch_keyboard_command_to_key(ge.command_idx);
-        } else {
-          c = touch_command_to_key(ge.command_idx);
-        }
+        c = touch_command_to_key(ge.command_idx);
       } else if (ge.action == GestureAction::TapMode) {
         c = '`';
       } else if (ge.action == GestureAction::TapLine) {
-        if (touch_keyboard_active()) {
-          c = touch_keyboard_char_from_tap(ge.x, ge.line_idx);
-        } else if (ge.line_idx >= 0 && ge.line_idx < 6) {
+        if (ge.line_idx >= 0 && ge.line_idx < 6) {
           c = (char)('1' + ge.line_idx);
         }
       } else if (ge.action == GestureAction::SwipeLeft || ge.action == GestureAction::SwipeRight) {
-        if (touch_keyboard_active()) {
-          // Avoid accidental mode switches while typing.
-        } else {
         int dir = (ge.action == GestureAction::SwipeLeft) ? 1 : -1;
         UIMode next = swipe_next_mode(ui_mode, dir);
         enter_mode(next);
@@ -3675,15 +3984,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           ui_force_redraw_rx();
           ui_draw_rx();
         }
-        }
       } else if (ge.action == GestureAction::SwipeUp || ge.action == GestureAction::SwipeDown) {
-        if (touch_keyboard_active()) {
-          // Ignore vertical swipes while keyboard is active.
-        } else {
-          int delta = (ge.action == GestureAction::SwipeDown) ? 1 : -1;
-          if (ui_mode == UIMode::RX) {
-            ui_rx_scroll(delta);
-          }
+        int delta = (ge.action == GestureAction::SwipeDown) ? 1 : -1;
+        if (ui_mode == UIMode::RX) {
+          ui_rx_scroll(delta);
         }
       }
     }
@@ -3698,6 +4002,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         c = injected;
         last_key = 0;  // Reset debounce so same-key injection works
       }
+    }
+    if (touch_keyboard_active()) {
+      c = 0;  // Touch keyboard owns edit input while active.
     }
     // Startup screen overlay on RX page: show until any key press, and only once
     if (g_startup_active) {
@@ -4480,3 +4787,4 @@ static void draw_status_line(int idx, const std::string& text, bool highlight) {
   }
   M5.Display.endWrite();
 }
+
