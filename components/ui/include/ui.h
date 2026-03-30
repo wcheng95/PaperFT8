@@ -20,6 +20,7 @@ struct UiLayout {
     UiRect waterfall;
     UiRect countdown;
     UiRect text_area;
+    UiRect command_bar;
     int line_h = 0;
 };
 
@@ -53,7 +54,10 @@ void ui_force_redraw_rx();
 const UiLayout& ui_layout();
 void ui_draw_mode_box(const char* mode_label);
 int ui_rx_hit_test(int x, int y); // returns absolute index or -1
+int ui_text_line_hit_test(int x, int y); // returns visible line index [0..5] or -1
 void ui_rx_scroll(int delta);     // delta = -1 prev, +1 next
+void ui_draw_command_bar();
+int ui_command_hit_test(int x, int y); // returns command button index or -1
 // Colors: pass same-length slot_colors (0 even->green, 1 odd->red) for next/queue
 void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete, const std::vector<int>& slot_colors = {});
 // Returns selected absolute index or -1 if none

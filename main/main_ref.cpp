@@ -253,31 +253,60 @@ void debug_log_line_public(const std::string& msg) {
 
 //static const char *TAG = "sdtest";
 
-#define PIN_NUM_MISO GPIO_NUM_39
-#define PIN_NUM_MOSI GPIO_NUM_14
-#define PIN_NUM_CLK  GPIO_NUM_40
-#define PIN_NUM_CS   GPIO_NUM_12
+struct SdSpiPins {
+    gpio_num_t sclk;
+    gpio_num_t mosi;
+    gpio_num_t miso;
+    gpio_num_t cs;
+};
+
+static SdSpiPins resolve_sd_spi_pins() {
+    // Fallback for M5PaperS3 in case board detection pin table is unavailable.
+    SdSpiPins pins = {
+        GPIO_NUM_39, // SCLK
+        GPIO_NUM_38, // MOSI (COPI)
+        GPIO_NUM_40, // MISO (CIPO)
+        GPIO_NUM_47, // CS
+    };
+
+    const int sclk = M5.getPin(m5::pin_name_t::sd_spi_sclk);
+    const int mosi = M5.getPin(m5::pin_name_t::sd_spi_mosi);
+    const int miso = M5.getPin(m5::pin_name_t::sd_spi_miso);
+    const int cs   = M5.getPin(m5::pin_name_t::sd_spi_cs);
+
+    if (sclk >= 0) pins.sclk = static_cast<gpio_num_t>(sclk);
+    if (mosi >= 0) pins.mosi = static_cast<gpio_num_t>(mosi);
+    if (miso >= 0) pins.miso = static_cast<gpio_num_t>(miso);
+    if (cs >= 0)   pins.cs   = static_cast<gpio_num_t>(cs);
+
+    return pins;
+}
 
 void mount_sd_spi(void)
 {
+    static const char* SD_TAG = "SD";
     esp_err_t ret;
     const char mount_point[] = "/sdcard";
+    const SdSpiPins pins = resolve_sd_spi_pins();
+    ESP_LOGI(SD_TAG, "SD SPI pins: sclk=%d mosi=%d miso=%d cs=%d",
+             (int)pins.sclk, (int)pins.mosi, (int)pins.miso, (int)pins.cs);
 
     spi_bus_config_t bus_cfg = {};
-    bus_cfg.mosi_io_num = PIN_NUM_MOSI;
-    bus_cfg.miso_io_num = PIN_NUM_MISO;
-    bus_cfg.sclk_io_num = PIN_NUM_CLK;
+    bus_cfg.mosi_io_num = pins.mosi;
+    bus_cfg.miso_io_num = pins.miso;
+    bus_cfg.sclk_io_num = pins.sclk;
     bus_cfg.quadwp_io_num = -1;
     bus_cfg.quadhd_io_num = -1;
     bus_cfg.max_transfer_sz = 4000;
 
     ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(SD_TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
         return;
     }
 
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.gpio_cs = pins.cs;
     slot_config.host_id = SPI2_HOST;
 
     esp_vfs_fat_mount_config_t mount_config = {};
@@ -290,6 +319,7 @@ void mount_sd_spi(void)
 
     ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &g_sd_card);
     if (ret != ESP_OK) {
+        ESP_LOGW(SD_TAG, "esp_vfs_fat_sdspi_mount failed: %s", esp_err_to_name(ret));
         spi_bus_free(SPI2_HOST);
         g_sd_card = NULL;
         g_sd_mounted = false;
@@ -813,6 +843,7 @@ enum class GestureAction {
   None,
   TapMode,
   TapLine,
+  TapCommand,
   SwipeLeft,
   SwipeRight,
   SwipeUp,
@@ -824,7 +855,10 @@ struct GestureEvent {
   int x = 0;
   int y = 0;
   int line_idx = -1;
+  int command_idx = -1;
 };
+static bool g_touch_key12_toggle = false;
+static constexpr int kTouchKbdCols = 10;
 static std::vector<std::string> g_q_lines;
 static std::vector<std::string> g_q_files;
 static bool g_q_show_entries = false;
@@ -906,6 +940,10 @@ static void draw_menu_view();
 static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging);
 static void draw_status_view();
 static void draw_status_line(int idx, const std::string& text, bool highlight);
+static void draw_touch_keyboard_overlay(const std::string& header);
+static bool touch_keyboard_active();
+static char touch_keyboard_char_from_tap(int x, int line_idx);
+static char touch_keyboard_command_to_key(int command_idx);
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 static void update_countdown();
 static void menu_flash_tick();
@@ -1688,6 +1726,14 @@ static void rtc_sync_to_hw() {
   time_t now = rtc_epoch_base + (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
   struct timeval tv = { .tv_sec = now, .tv_usec = 0 };
   settimeofday(&tv, NULL);
+
+  // Also push system time into external RTC (BM8563/PCF8563-compatible backend).
+  if (M5.Rtc.isEnabled()) {
+    struct tm t_utc;
+    gmtime_r(&now, &t_utc);
+    M5.Rtc.setDateTime(&t_utc);
+  }
+
   ESP_LOGI(TAG, "Hardware RTC synced from soft RTC");
 }
 
@@ -1855,6 +1901,28 @@ static UIMode swipe_next_mode(UIMode current, int dir) {
   return order[next];
 }
 
+static char touch_command_to_key(int command_idx) {
+  switch (command_idx) {
+    case 0: {  // "12"
+      char key = g_touch_key12_toggle ? '2' : '1';
+      g_touch_key12_toggle = !g_touch_key12_toggle;
+      return key;
+    }
+    case 1: return '`';  // ESC
+    case 2: return 'S';
+    case 3: return 'R';
+    case 4: return 'T';
+    case 5: return 'Q';
+    case 6: return 'M';
+    case 7: return 'B';
+    case 8: return 'C';
+    case 9: return 'D';
+    case 10: return ';'; // prev/up
+    case 11: return '.'; // next/down
+    default: return 0;
+  }
+}
+
 static bool poll_gesture(GestureEvent& out) {
   static bool tracking = false;
   static int start_x = 0;
@@ -1885,14 +1953,20 @@ static bool poll_gesture(GestureEvent& out) {
     const int tap_thresh = 8;
     const int swipe_thresh = 24;
     if (abs(dx) < tap_thresh && abs(dy) < tap_thresh) {
-      int idx = ui_rx_hit_test(last_x, last_y);
-      if (idx >= 0) {
-        out.action = GestureAction::TapLine;
-        out.line_idx = idx;
+      int cmd = ui_command_hit_test(last_x, last_y);
+      if (cmd >= 0) {
+        out.action = GestureAction::TapCommand;
+        out.command_idx = cmd;
       } else {
-        const UiLayout& lay = ui_layout();
-        if (lay.mode_box.contains(last_x, last_y)) {
-          out.action = GestureAction::TapMode;
+        int line = ui_text_line_hit_test(last_x, last_y);
+        if (line >= 0) {
+          out.action = GestureAction::TapLine;
+          out.line_idx = line;
+        } else {
+          const UiLayout& lay = ui_layout();
+          if (lay.mode_box.contains(last_x, last_y)) {
+            out.action = GestureAction::TapMode;
+          }
         }
       }
       out.x = last_x;
@@ -2382,7 +2456,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   g_decode_in_progress = false;  // Allow TX trigger now that decode is complete
 }
 
-static void draw_menu_long_edit() {
+[[maybe_unused]] static void draw_menu_long_edit() {
   std::vector<std::string> lines(6, "");
   std::string text = menu_long_buf;
   size_t idx = 0;
@@ -2401,6 +2475,73 @@ static void draw_menu_long_edit() {
     else if (line < 6) lines[line] = "_";
   }
   ui_draw_list(lines, 0, -1);
+}
+
+static bool touch_keyboard_active() {
+  if (ui_mode == UIMode::STATUS) {
+    return (status_edit_idx == 4 || status_edit_idx == 5);
+  }
+  if (ui_mode == UIMode::MENU) {
+    return menu_long_edit || (menu_edit_idx >= 0);
+  }
+  return false;
+}
+
+static void draw_touch_keyboard_overlay(const std::string& header) {
+  std::vector<std::string> lines;
+  lines.reserve(6);
+  lines.push_back(head_trim(header, 22));
+  lines.push_back("1 2 3 4 5 6 7 8 9 0");
+  lines.push_back("Q W E R T Y U I O P");
+  lines.push_back("A S D F G H J K L -");
+  lines.push_back("Z X C V B N M / . _");
+  lines.push_back("_ @ ? : , + ; ( ) '");
+  ui_draw_list(lines, 0, -1);
+}
+
+static char touch_keyboard_char_from_tap(int x, int line_idx) {
+  if (line_idx <= 0 || line_idx > 5) return 0;
+
+  static const char* rows[] = {
+    "1234567890",
+    "QWERTYUIOP",
+    "ASDFGHJKL-",
+    "ZXCVBNM/._",
+    "_@?:,+;()'",
+  };
+
+  int w = ui_layout().screen_w;
+  if (w <= 0) w = 1;
+  int col = (x * kTouchKbdCols) / w;
+  if (col < 0) col = 0;
+  if (col >= kTouchKbdCols) col = kTouchKbdCols - 1;
+
+  char ch = rows[line_idx - 1][col];
+  return (ch == '_') ? ' ' : ch;
+}
+
+static char touch_keyboard_command_to_key(int command_idx) {
+  switch (command_idx) {
+    case 0: return '\n';  // 12 => OK
+    case 1: return '`';   // ESC
+    case 7: return 0x08;  // B => backspace
+    case 8: return ' ';   // C => space
+    case 10: return ',';  // ^ => left
+    case 11: return '/';  // v => right
+    default: return 0;
+  }
+}
+
+static const char* menu_edit_label(int idx) {
+  switch (idx) {
+    case 3:  return "Call";
+    case 4:  return "Grid";
+    case 7:  return "Cursor";
+    case 9:  return "Antenna";
+    case 10: return "Comment";
+    case 15: return "RTC Comp";
+    default: return "Edit";
+  }
 }
 
 static void log_tones(const uint8_t* tones, size_t n) {
@@ -2651,10 +2792,14 @@ static void tx_tick() {
 }
 
 static void draw_menu_view() {
-    if (menu_long_edit) {
-      draw_menu_long_edit();
-      return;
-    }
+  if (menu_long_edit) {
+    draw_touch_keyboard_overlay(std::string("Edit: ") + menu_long_buf + "_");
+    return;
+  }
+  if (menu_edit_idx >= 0) {
+    draw_touch_keyboard_overlay(std::string(menu_edit_label(menu_edit_idx)) + ": " + menu_edit_buf);
+    return;
+  }
   std::vector<std::string> lines;
   lines.reserve(12);
 
@@ -2723,6 +2868,12 @@ static void draw_menu_view() {
 }
 
 static void draw_status_view() {
+  if (status_edit_idx == 4 || status_edit_idx == 5) {
+    const char* label = (status_edit_idx == 4) ? "Date: " : "Time: ";
+    draw_touch_keyboard_overlay(std::string(label) + highlight_pos(status_edit_buffer, status_cursor_pos));
+    return;
+  }
+
   std::string lines[6];
   BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
   lines[0] = std::string("Beacon: ") + beacon_name(disp_beacon);
@@ -2749,6 +2900,7 @@ static void draw_status_view() {
     bool hl = (status_edit_idx == i);
     draw_status_line(i, lines[i], hl);
   }
+  M5.Display.display();
 }
 
 static void debug_log_line(const std::string& msg) {
@@ -3025,6 +3177,11 @@ static void host_handle_line(const std::string& line_in) {
       if (wait_ms > 0) vTaskDelay(pdMS_TO_TICKS(wait_ms));
       struct timeval tv = { .tv_sec = sleep_epoch, .tv_usec = 0 };
       settimeofday(&tv, NULL);
+      if (M5.Rtc.isEnabled()) {
+        struct tm t_utc;
+        gmtime_r(&sleep_epoch, &t_utc);
+        M5.Rtc.setDateTime(&t_utc);
+      }
     }
     send("OK: entering deep sleep");
     M5.Display.sleep();
@@ -3238,10 +3395,10 @@ static void load_station_data() {
       g_offset_hz = val;
     } else if (sscanf(line, "band_sel=%d", &val) == 1) {
       if (val >= 0 && val < (int)g_bands.size()) g_band_sel = val;
-    } else if (sscanf(line, "date=%63s", line) == 1) {
-      g_date = line;
-    } else if (sscanf(line, "time=%63s", line) == 1) {
-      g_time = line;
+    } else if (strncmp(line, "date=", 5) == 0) {
+      g_date = trim_copy(line + 5);
+    } else if (strncmp(line, "time=", 5) == 0) {
+      g_time = trim_copy(line + 5);
     } else if (sscanf(line, "cq_type=%d", &val) == 1) {
       if (val >= 0 && val <= 5) g_cq_type = (CqType)val;
     } else if (sscanf(line, "offset_src=%d", &val) == 1) {
@@ -3493,24 +3650,24 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     char c = 0;
     GestureEvent ge;
     if (poll_gesture(ge)) {
-      if (ge.action == GestureAction::TapMode) {
+      if (ge.action == GestureAction::TapCommand) {
+        if (touch_keyboard_active()) {
+          c = touch_keyboard_command_to_key(ge.command_idx);
+        } else {
+          c = touch_command_to_key(ge.command_idx);
+        }
+      } else if (ge.action == GestureAction::TapMode) {
         c = '`';
-      } else if (ge.action == GestureAction::TapLine && ui_mode == UIMode::RX) {
-        if (ge.line_idx >= 0 && ge.line_idx < (int)g_rx_lines.size()) {
-          autoseq_on_touch(g_rx_lines[ge.line_idx]);
-          g_tx_view_dirty = true;
-          AutoseqTxEntry pending;
-          if (autoseq_fetch_pending_tx(pending)) {
-            g_qso_xmit = true;
-            g_target_slot_parity = pending.slot_id & 1;
-            g_pending_tx = pending;
-            g_pending_tx_valid = true;
-          }
-          rx_flash_idx = ge.line_idx;
-          rx_flash_deadline = rtc_now_ms() + 500;
-          ui_draw_rx(rx_flash_idx);
+      } else if (ge.action == GestureAction::TapLine) {
+        if (touch_keyboard_active()) {
+          c = touch_keyboard_char_from_tap(ge.x, ge.line_idx);
+        } else if (ge.line_idx >= 0 && ge.line_idx < 6) {
+          c = (char)('1' + ge.line_idx);
         }
       } else if (ge.action == GestureAction::SwipeLeft || ge.action == GestureAction::SwipeRight) {
+        if (touch_keyboard_active()) {
+          // Avoid accidental mode switches while typing.
+        } else {
         int dir = (ge.action == GestureAction::SwipeLeft) ? 1 : -1;
         UIMode next = swipe_next_mode(ui_mode, dir);
         enter_mode(next);
@@ -3518,10 +3675,15 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           ui_force_redraw_rx();
           ui_draw_rx();
         }
+        }
       } else if (ge.action == GestureAction::SwipeUp || ge.action == GestureAction::SwipeDown) {
-        int delta = (ge.action == GestureAction::SwipeDown) ? 1 : -1;
-        if (ui_mode == UIMode::RX) {
-          ui_rx_scroll(delta);
+        if (touch_keyboard_active()) {
+          // Ignore vertical swipes while keyboard is active.
+        } else {
+          int delta = (ge.action == GestureAction::SwipeDown) ? 1 : -1;
+          if (ui_mode == UIMode::RX) {
+            ui_rx_scroll(delta);
+          }
         }
       }
     }
@@ -4103,6 +4265,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 draw_menu_view();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
+                if ((menu_edit_idx == 7 || menu_edit_idx == 15)
+                    && !((ch >= '0' && ch <= '9') || ch == '-')) {
+                  break;
+                }
                 if (menu_edit_idx % 6 == 3 || menu_edit_idx % 6 == 4 || menu_edit_idx % 6 == 5) {
                   ch = toupper((unsigned char)ch);
                 }
@@ -4271,15 +4437,23 @@ extern "C" void app_main(void) {
   init_bluetooth();   // runs on core0
 }
 static void draw_status_line(int idx, const std::string& text, bool highlight) {
-  const int line_h = 19;
-  const int start_y = 18 + 3 + 3; // WATERFALL_H + COUNTDOWN_H + gap
+  const UiLayout& lay = ui_layout();
+  const int line_h = lay.line_h;
+  const int start_y = lay.text_area.y;
   int y = start_y + idx * line_h;
-  uint16_t bg = highlight ? M5.Display.color565(30, 30, 60) : TFT_BLACK;
-  M5.Display.setTextSize(2);
-  M5.Display.fillRect(0, y, 240, line_h, bg);
-  M5.Display.setTextColor(TFT_WHITE, bg);
-  M5.Display.setCursor(0, y);
-  M5.Display.printf("%d %s", idx + 1, text.c_str());
+  uint16_t bg = TFT_WHITE;
+  M5.Display.fillRect(0, y, lay.screen_w, line_h, bg);
+  M5.Display.drawFastHLine(0, y, lay.screen_w, TFT_BLACK);
+  M5.Display.drawFastHLine(0, y + line_h - 1, lay.screen_w, TFT_BLACK);
+  M5.Display.setTextColor(TFT_BLACK, bg);
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.setTextSize(4);
+  char buf[160];
+  std::snprintf(buf, sizeof(buf), "%d %s", idx + 1, text.c_str());
+  M5.Display.drawString(buf, 24, y + (line_h / 2));
+  if (highlight) {
+    M5.Display.drawRect(0, y, lay.screen_w, line_h, TFT_BLACK);
+  }
 }
 [[maybe_unused]] static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging) {
   if (level < 0) level = 0;
