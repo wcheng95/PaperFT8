@@ -24,6 +24,9 @@ static constexpr int kTextLeftPx = 24;
 static constexpr int kWaterfallCols = 240;
 static constexpr int kWaterfallRows = 24;
 static constexpr int64_t kWaterfallDrawMinMs = 700;
+static constexpr int kWaterfallFreqMinHz = 200;
+static constexpr int kWaterfallFreqMaxHz = 3000;
+static constexpr int kWaterfallMarksHz[] = {500, 1000, 1500, 2000, 2500};
 
 static constexpr uint16_t UI_BG = TFT_WHITE;
 static constexpr uint16_t UI_FG = TFT_BLACK;
@@ -52,6 +55,8 @@ static bool g_countdown_enabled = false;  // runtime toggle via command button 0
 
 static bool g_countdown_even = true;
 static int g_countdown_second = 0;  // 0..12 within 15s slot
+static bool g_countdown_visual_initialized = false;
+static bool g_countdown_visual_odd = false;
 
 static uint8_t g_waterfall_ring[kWaterfallRows][kWaterfallCols] = {};
 static int g_waterfall_head = 0;  // next write row
@@ -137,9 +142,48 @@ static void draw_row_frame(int line_idx) {
     M5.Display.drawFastHLine(0, row_y + kLineHeightPx - 1, g_layout.screen_w, UI_FG);
 }
 
+static void draw_waterfall_freq_marks_locked() {
+    const UiRect& wf = g_layout.waterfall;
+    if (wf.w <= 0 || wf.h <= 0) return;
+    if (kWaterfallFreqMaxHz <= kWaterfallFreqMinHz) return;
+
+    const int row_y = line_y(kTopLineIdx);
+    const int scale_top = row_y + 2;
+    const int scale_bottom = wf.y - 2;
+    if (scale_bottom <= scale_top) return;
+
+    const int axis_y = std::max(scale_top + 10, scale_bottom - 8);
+    M5.Display.drawFastHLine(wf.x, axis_y, wf.w, UI_FG);
+
+    M5.Display.setTextColor(UI_FG, UI_BG);
+    M5.Display.setTextDatum(top_center);
+    M5.Display.setTextSize(2);
+
+    // Minor ticks every 100 Hz (no labels); skip major-tick positions.
+    for (int hz = kWaterfallFreqMinHz; hz <= kWaterfallFreqMaxHz; hz += 100) {
+        if ((hz % 500) == 0) continue;
+        const float t = float(hz - kWaterfallFreqMinHz) / float(kWaterfallFreqMaxHz - kWaterfallFreqMinHz);
+        if (t < 0.0f || t > 1.0f) continue;
+        const int x = wf.x + (int)std::lround(t * float(wf.w - 1));
+        M5.Display.drawFastVLine(x, axis_y - 2, 5, UI_FG);
+    }
+
+    for (int hz : kWaterfallMarksHz) {
+        const float t = float(hz - kWaterfallFreqMinHz) / float(kWaterfallFreqMaxHz - kWaterfallFreqMinHz);
+        if (t < 0.0f || t > 1.0f) continue;
+        const int x = wf.x + (int)std::lround(t * float(wf.w - 1));
+        M5.Display.drawFastVLine(x, axis_y - 5, 11, UI_FG);
+
+        char label[8];
+        std::snprintf(label, sizeof(label), "%d", hz);
+        M5.Display.drawString(label, x, scale_top);
+    }
+}
+
 static void draw_mode_row(const char* text) {
     (void)text;
     draw_row_frame(kTopLineIdx);
+    draw_waterfall_freq_marks_locked();
 }
 
 static void draw_countdown_locked() {
@@ -171,14 +215,13 @@ static void draw_waterfall_locked(const uint8_t rows[kWaterfallRows][kWaterfallC
                                   bool has_data) {
     if (!g_header_widgets_enabled) return;
     const UiRect& r = g_layout.waterfall;
-    if (r.w <= 2 || r.h <= 2) return;
+    if (r.w <= 0 || r.h <= 0) return;
 
     M5.Display.fillRect(r.x, r.y, r.w, r.h, UI_BG);
-    M5.Display.drawRect(r.x, r.y, r.w, r.h, UI_FG);
     if (!has_data) return;
 
-    const int inner_w = r.w - 2;
-    const int inner_h = r.h - 2;
+    const int inner_w = r.w;
+    const int inner_h = r.h;
     if (inner_w <= 0 || inner_h <= 0) return;
 
     for (int y = 0; y < inner_h; ++y) {
@@ -193,7 +236,7 @@ static void draw_waterfall_locked(const uint8_t rows[kWaterfallRows][kWaterfallC
             else if (v >= 145) on = (((x + y) & 1) == 0);
             else if (v >= 115) on = (((x ^ y) & 3) == 0);
             if (on) {
-                M5.Display.drawPixel(r.x + 1 + x, r.y + 1 + y, UI_FG);
+                M5.Display.drawPixel(r.x + x, r.y + y, UI_FG);
             }
         }
     }
@@ -225,10 +268,33 @@ static void draw_command_button_locked(int button_idx) {
 
     if (button_idx == 0 && g_countdown_enabled) {
         const bool odd = !g_countdown_even;
-        const uint16_t bg = odd ? UI_FG : UI_BG;
-        const uint16_t fg = odd ? UI_BG : UI_FG;
-        M5.Display.fillRect(x0, row_y, w, kLineHeightPx, bg);
-        M5.Display.drawRect(x0, row_y, w, kLineHeightPx, UI_FG);
+        const uint16_t bg = UI_BG;
+        const uint16_t fg = UI_FG;
+        const bool full_redraw = !g_countdown_visual_initialized || (g_countdown_visual_odd != odd);
+        if (full_redraw) {
+            M5.Display.fillRect(x0, row_y, w, kLineHeightPx, bg);
+            M5.Display.drawRect(x0, row_y, w, kLineHeightPx, UI_FG);
+            if (odd) {
+                // Odd slot: use a heavier inner frame while keeping black-on-white text/background.
+                for (int inset = 1; inset <= 3; ++inset) {
+                    const int rw = w - (inset * 2);
+                    const int rh = kLineHeightPx - (inset * 2);
+                    if (rw <= 0 || rh <= 0) break;
+                    M5.Display.drawRect(x0 + inset, row_y + inset, rw, rh, UI_FG);
+                }
+            }
+            g_countdown_visual_initialized = true;
+            g_countdown_visual_odd = odd;
+        } else {
+            // Keep button background stable and only refresh the center label area.
+            const int inner_pad_x = 6;
+            const int inner_pad_y = 6;
+            const int inner_w = std::max(0, w - (inner_pad_x * 2));
+            const int inner_h = std::max(0, kLineHeightPx - (inner_pad_y * 2));
+            if (inner_w > 0 && inner_h > 0) {
+                M5.Display.fillRect(x0 + inner_pad_x, row_y + inner_pad_y, inner_w, inner_h, bg);
+            }
+        }
         M5.Display.setTextColor(fg, bg);
         M5.Display.setTextDatum(middle_center);
         M5.Display.setTextSize(kCommandTextSize);
@@ -236,6 +302,10 @@ static void draw_command_button_locked(int button_idx) {
         std::snprintf(label, sizeof(label), "%d", g_countdown_second);
         M5.Display.drawString(label, x0 + (w / 2), row_y + (kLineHeightPx / 2));
         return;
+    }
+
+    if (button_idx == 0) {
+        g_countdown_visual_initialized = false;
     }
 
     const bool active = (button_idx == g_active_mode_button);
@@ -260,6 +330,7 @@ static void draw_command_button_locked(int button_idx) {
 }
 
 static void draw_command_bar_locked() {
+    g_countdown_visual_initialized = false;
     for (int i = 0; i < kCommandButtons; ++i) {
         draw_command_button_locked(i);
     }
@@ -300,9 +371,9 @@ void ui_init() {
         const int row_y = line_y(kTopLineIdx);
         const int cd_w = std::max(190, g_layout.screen_w / 4);
         g_layout.countdown = {g_layout.screen_w - cd_w - 8, row_y + 4, cd_w, 26};
-        const int wf_x = std::min(120, g_layout.screen_w / 6);
+        const int wf_x = 0;
         const int wf_y = row_y + 34;
-        int wf_w = g_layout.screen_w - wf_x - 8;
+        int wf_w = g_layout.screen_w;
         if (wf_w < 16) wf_w = 16;
         int wf_h = (row_y + kLineHeightPx) - wf_y - 4;
         if (wf_h < 8) wf_h = 8;
