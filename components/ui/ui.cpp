@@ -153,11 +153,20 @@ static void draw_waterfall_freq_marks_locked() {
     if (scale_bottom <= scale_top) return;
 
     const int axis_y = std::max(scale_top + 10, scale_bottom - 8);
-    M5.Display.drawFastHLine(wf.x, axis_y, wf.w, UI_FG);
 
     M5.Display.setTextColor(UI_FG, UI_BG);
     M5.Display.setTextDatum(top_center);
     M5.Display.setTextSize(2);
+
+    auto draw_thick_tick = [&](int x, int y, int h, int thickness) {
+        if (h <= 0 || thickness <= 0) return;
+        int left = x - ((thickness - 1) / 2);
+        int right = left + thickness - 1;
+        for (int xx = left; xx <= right; ++xx) {
+            if (xx < wf.x || xx >= (wf.x + wf.w)) continue;
+            M5.Display.drawFastVLine(xx, y, h, UI_FG);
+        }
+    };
 
     // Minor ticks every 100 Hz (no labels); skip major-tick positions.
     for (int hz = kWaterfallFreqMinHz; hz <= kWaterfallFreqMaxHz; hz += 100) {
@@ -165,14 +174,14 @@ static void draw_waterfall_freq_marks_locked() {
         const float t = float(hz - kWaterfallFreqMinHz) / float(kWaterfallFreqMaxHz - kWaterfallFreqMinHz);
         if (t < 0.0f || t > 1.0f) continue;
         const int x = wf.x + (int)std::lround(t * float(wf.w - 1));
-        M5.Display.drawFastVLine(x, axis_y - 2, 5, UI_FG);
+        draw_thick_tick(x, axis_y - 2, 5, 2);
     }
 
     for (int hz : kWaterfallMarksHz) {
         const float t = float(hz - kWaterfallFreqMinHz) / float(kWaterfallFreqMaxHz - kWaterfallFreqMinHz);
         if (t < 0.0f || t > 1.0f) continue;
         const int x = wf.x + (int)std::lround(t * float(wf.w - 1));
-        M5.Display.drawFastVLine(x, axis_y - 5, 11, UI_FG);
+        draw_thick_tick(x, axis_y - 5, 11, 3);
 
         char label[8];
         std::snprintf(label, sizeof(label), "%d", hz);
