@@ -57,6 +57,15 @@ int ui_rx_hit_test(int x, int y); // returns absolute index or -1
 int ui_text_line_hit_test(int x, int y); // returns visible line index [0..5] or -1
 void ui_rx_scroll(int delta);     // delta = -1 prev, +1 next
 void ui_draw_command_bar();
+// Highlight one mode command button (S/R/T/Q/M/B/C/D) as active using inverted colors.
+// Pass 0 or unsupported key to clear highlight.
+void ui_set_active_mode_button(char mode_key);
+void ui_set_countdown_enabled(bool enabled);
+void ui_toggle_countdown_enabled();
+bool ui_is_countdown_enabled();
+// Enable/disable a command button by key label (e.g. 'C', 'R', 'S', ...).
+// Disabled buttons are not hit-testable.
+void ui_set_command_enabled(char command_key, bool enabled);
 int ui_command_hit_test(int x, int y); // returns command button index or -1
 // Colors: pass same-length slot_colors (0 even->green, 1 odd->red) for next/queue
 void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete, const std::vector<int>& slot_colors = {});

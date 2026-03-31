@@ -91,16 +91,20 @@ void holdKey(TouchKeyboard& kb, MockHost& host, const char* label, uint32_t hold
 void printEditWindow(const TouchKeyboard& kb) {
   const VisibleLines v = kb.getVisibleLines();
 
-  std::printf("+------------+\n");
+  std::printf("+");
+  for (size_t i = 0; i < v.cols; ++i) std::printf("-");
+  std::printf("+\n");
   std::printf("|%s|\n", v.lines[0].data());
   std::printf("|%s|\n", v.lines[1].data());
-  std::printf("+------------+\n");
+  std::printf("+");
+  for (size_t i = 0; i < v.cols; ++i) std::printf("-");
+  std::printf("+\n");
 
   if (v.cursorVisible) {
-    char marker[VisibleLines::kCols + 1];
-    std::memset(marker, ' ', VisibleLines::kCols);
-    marker[VisibleLines::kCols] = '\0';
-    marker[v.cursorCol] = '^';
+    char marker[VisibleLines::kMaxCols + 1];
+    std::memset(marker, ' ', v.cols);
+    marker[v.cols] = '\0';
+    if (v.cursorCol < v.cols) marker[v.cursorCol] = '^';
     std::printf(" %s  cursor(line=%u col=%u)\n",
                 marker,
                 static_cast<unsigned>(v.cursorLine),

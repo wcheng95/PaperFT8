@@ -856,7 +856,6 @@ struct GestureEvent {
   int line_idx = -1;
   int command_idx = -1;
 };
-static bool g_touch_key12_toggle = false;
 static std::vector<std::string> g_q_lines;
 static std::vector<std::string> g_q_files;
 static bool g_q_show_entries = false;
@@ -933,7 +932,7 @@ static int64_t menu_flash_deadline = 0;  // ms timestamp when flash ends
 static bool menu_delete_confirm = false;  // confirmation state for Delete Logs
 static int rx_flash_idx = -1;
 static int64_t rx_flash_deadline = 0;
-enum class TouchKbdEditTarget { None, MenuLong, MenuEdit, StatusDate, StatusTime };
+enum class TouchKbdEditTarget { None, MenuLong, MenuEdit, BandFreq, StatusDate, StatusTime };
 static TouchKbdEditTarget g_touchkbd_target = TouchKbdEditTarget::None;
 static std::string g_touchkbd_header;
 static char g_touchkbd_buffer[256] = {0};
@@ -941,6 +940,50 @@ static bool g_touchkbd_needs_display = false;
 bool g_streaming = false;
 static void draw_menu_view();
 static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging);
+static std::string digits_only_limited(const std::string& in, size_t max_len) {
+  std::string out;
+  out.reserve(max_len);
+  for (unsigned char ch : in) {
+    if (std::isdigit(ch) != 0) {
+      out.push_back(static_cast<char>(ch));
+      if (out.size() >= max_len) break;
+    }
+  }
+  return out;
+}
+
+static std::string format_date_digits_preview(const std::string& digits) {
+  static constexpr int kPos[8] = {0, 1, 2, 3, 5, 6, 8, 9};
+  std::string out = "____-__-__";
+  const size_t n = std::min<size_t>(digits.size(), 8);
+  for (size_t i = 0; i < n; ++i) out[kPos[i]] = digits[i];
+  return out;
+}
+
+static std::string format_time_digits_preview(const std::string& digits) {
+  static constexpr int kPos[6] = {0, 1, 3, 4, 6, 7};
+  std::string out = "__:__:__";
+  const size_t n = std::min<size_t>(digits.size(), 6);
+  for (size_t i = 0; i < n; ++i) out[kPos[i]] = digits[i];
+  return out;
+}
+
+static bool format_date_digits_exact(const std::string& digits, std::string& out) {
+  if (digits.size() != 8) return false;
+  out.assign("____-__-__");
+  static constexpr int kPos[8] = {0, 1, 2, 3, 5, 6, 8, 9};
+  for (size_t i = 0; i < 8; ++i) out[kPos[i]] = digits[i];
+  return true;
+}
+
+static bool format_time_digits_exact(const std::string& digits, std::string& out) {
+  if (digits.size() != 6) return false;
+  out.assign("__:__:__");
+  static constexpr int kPos[6] = {0, 1, 3, 4, 6, 7};
+  for (size_t i = 0; i < 6; ++i) out[kPos[i]] = digits[i];
+  return true;
+}
+
 static void draw_status_view();
 static void draw_status_line(int idx, const std::string& text, bool highlight);
 static void draw_touch_keyboard_overlay(const std::string& header);
@@ -1540,16 +1583,15 @@ static void redraw_tx_view() {
 }
 
 static void draw_band_view() {
+  if (band_edit_idx >= 0 && band_edit_idx < (int)g_bands.size()) {
+    draw_touch_keyboard_overlay(std::string("Band ") + g_bands[band_edit_idx].name + ": " + band_edit_buffer);
+    return;
+  }
+
   std::vector<std::string> lines;
   lines.reserve(g_bands.size());
   for (size_t i = 0; i < g_bands.size(); ++i) {
-    std::string freq_str;
-    if ((int)i == band_edit_idx && !band_edit_buffer.empty()) {
-      freq_str = band_edit_buffer;
-    } else {
-      freq_str = std::to_string(g_bands[i].freq);
-    }
-    lines.push_back(std::string(g_bands[i].name) + ": " + freq_str);
+    lines.push_back(std::string(g_bands[i].name) + ": " + std::to_string(g_bands[i].freq));
   }
   ui_draw_list(lines, band_page, band_edit_idx);
 }
@@ -1624,7 +1666,7 @@ static std::string elide_right(const std::string& s, size_t max_len = 22) {
   return std::string("...") + s.substr(s.size() - (max_len - 3));
 }
 
-static std::string head_trim(const std::string& s, size_t max_len = 16) {
+static std::string head_trim(const std::string& s, size_t max_len = 35) {
   if (s.size() <= max_len) return s;
   if (max_len == 0) return "";
   if (max_len == 1) return ">";
@@ -1642,8 +1684,6 @@ static std::string highlight_pos(const std::string& s, int pos) {
   out.append(s, pos + 1, std::string::npos);
   return out;
 }
-
-static void draw_status_view();
 
 static bool rtc_set_from_strings() {
   int y, M, d, h, m, s;
@@ -1907,9 +1947,9 @@ static UIMode swipe_next_mode(UIMode current, int dir) {
 static char touch_command_to_key(int command_idx) {
   switch (command_idx) {
     case 0: {  // "12"
-      char key = g_touch_key12_toggle ? '2' : '1';
-      g_touch_key12_toggle = !g_touch_key12_toggle;
-      return key;
+      ui_toggle_countdown_enabled();
+      debug_log_line(ui_is_countdown_enabled() ? "Countdown ON" : "Countdown OFF");
+      return 0;
     }
     case 1: return '`';  // ESC
     case 2: return 'S';
@@ -1924,6 +1964,11 @@ static char touch_command_to_key(int command_idx) {
     case 11: return '.'; // next/down
     default: return 0;
   }
+}
+
+static bool control_mode_blocked_by_uac() {
+  const uac_stream_state_t st = uac_get_state();
+  return st == UAC_STATE_CONNECTED || st == UAC_STATE_STREAMING;
 }
 
 static bool poll_gesture(GestureEvent& out) {
@@ -2484,6 +2529,9 @@ static bool touch_keyboard_active() {
   if (ui_mode == UIMode::MENU) {
     return menu_long_edit || (menu_edit_idx >= 0);
   }
+  if (ui_mode == UIMode::BAND) {
+    return (band_edit_idx >= 0);
+  }
   return false;
 }
 
@@ -2567,7 +2615,7 @@ static TouchKeyboardRenderer& touch_keyboard_renderer() {
 }
 
 static touchkbd::TouchKeyboard& touch_keyboard_instance() {
-  static touchkbd::Config cfg;
+  static touchkbd::Config cfg = [] { touchkbd::Config c; c.viewportCols = 38; return c; }();
   static touchkbd::TouchKeyboard keyboard(touch_keyboard_host(), &touch_keyboard_renderer(), cfg);
   return keyboard;
 }
@@ -2591,9 +2639,14 @@ static void touch_keyboard_apply_buffer_shadow() {
     case TouchKbdEditTarget::MenuEdit:
       menu_edit_buf = text;
       break;
+    case TouchKbdEditTarget::BandFreq:
+      band_edit_buffer = text;
+      break;
     case TouchKbdEditTarget::StatusDate:
+      status_edit_buffer = digits_only_limited(text, 8);
+      break;
     case TouchKbdEditTarget::StatusTime:
-      status_edit_buffer = text;
+      status_edit_buffer = digits_only_limited(text, 6);
       break;
     case TouchKbdEditTarget::None:
       break;
@@ -2632,9 +2685,19 @@ static void touch_keyboard_draw_edit_window() {
   if (visible.cursorVisible && visible.cursorLine < 2) {
     const int text_left = x + 24;
     const int text_right = x + lay.text_area.w - 24;
-    const int text_w = std::max(1, text_right - text_left);
-    const int cell_w = std::max(1, text_w / static_cast<int>(touchkbd::VisibleLines::kCols));
-    const int cursor_x = text_left + static_cast<int>(visible.cursorCol) * cell_w;
+    const int fallback_char_w = std::max(1, static_cast<int>(M5.Display.textWidth("0")));
+    int advance_px = 0;
+    char glyph[2] = {0, 0};
+    const size_t col_count = std::min(visible.cursorCol, visible.cols);
+    for (size_t i = 0; i < col_count; ++i) {
+      glyph[0] = visible.lines[visible.cursorLine][i];
+      int glyph_w = static_cast<int>(M5.Display.textWidth(glyph));
+      if (glyph_w <= 0 && glyph[0] == ' ') glyph_w = fallback_char_w;
+      if (glyph_w <= 0) glyph_w = fallback_char_w;
+      advance_px += glyph_w;
+    }
+    int cursor_x = text_left + advance_px;
+    if (cursor_x > (text_right - 1)) cursor_x = text_right - 1;
     const int cursor_y = y + static_cast<int>(visible.cursorLine) * row_h;
     M5.Display.drawFastVLine(cursor_x, cursor_y + 10, row_h - 20, TFT_BLACK);
   }
@@ -2715,13 +2778,55 @@ static void touch_keyboard_commit_current() {
       draw_menu_view();
       break;
     }
+    case TouchKbdEditTarget::BandFreq: {
+      bool applied = false;
+      if (band_edit_idx >= 0 && band_edit_idx < (int)g_bands.size()) {
+        if (!band_edit_buffer.empty() &&
+            std::all_of(band_edit_buffer.begin(), band_edit_buffer.end(),
+                        [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
+          int val = std::atoi(band_edit_buffer.c_str());
+          g_bands[band_edit_idx].freq = val;
+          save_station_data();
+          applied = true;
+        }
+      }
+      band_edit_idx = -1;
+      band_edit_buffer.clear();
+      touch_keyboard_end_session();
+      draw_band_view();
+      if (!applied) {
+        debug_log_line("Band freq unchanged");
+      }
+      break;
+    }
     case TouchKbdEditTarget::StatusDate:
     case TouchKbdEditTarget::StatusTime: {
-      if (g_touchkbd_target == TouchKbdEditTarget::StatusDate) g_date = status_edit_buffer;
-      else g_time = status_edit_buffer;
-      save_station_data();
-      rtc_set_from_strings();
-      rtc_sync_to_hw();
+      const bool is_date = (g_touchkbd_target == TouchKbdEditTarget::StatusDate);
+      const std::string prev_date = g_date;
+      const std::string prev_time = g_time;
+      std::string formatted;
+      bool ok = is_date
+          ? format_date_digits_exact(status_edit_buffer, formatted)
+          : format_time_digits_exact(status_edit_buffer, formatted);
+
+      if (ok) {
+        if (is_date) g_date = formatted;
+        else g_time = formatted;
+
+        if (rtc_set_from_strings()) {
+          save_station_data();
+          rtc_sync_to_hw();
+        } else {
+          ok = false;
+        }
+      }
+
+      if (!ok) {
+        g_date = prev_date;
+        g_time = prev_time;
+        debug_log_line(is_date ? "Invalid date; unchanged" : "Invalid time; unchanged");
+      }
+
       status_edit_idx = -1;
       status_cursor_pos = -1;
       status_edit_buffer.clear();
@@ -2750,6 +2855,12 @@ static void touch_keyboard_cancel_current() {
       touch_keyboard_end_session();
       draw_menu_view();
       break;
+    case TouchKbdEditTarget::BandFreq:
+      band_edit_idx = -1;
+      band_edit_buffer.clear();
+      touch_keyboard_end_session();
+      draw_band_view();
+      break;
     case TouchKbdEditTarget::StatusDate:
     case TouchKbdEditTarget::StatusTime:
       status_edit_idx = -1;
@@ -2774,6 +2885,11 @@ static void draw_touch_keyboard_overlay(const std::string& header) {
     } else if (menu_edit_idx >= 0) {
       target = TouchKbdEditTarget::MenuEdit;
       initial_text = menu_edit_buf;
+    }
+  } else if (ui_mode == UIMode::BAND) {
+    if (band_edit_idx >= 0 && band_edit_idx < (int)g_bands.size()) {
+      target = TouchKbdEditTarget::BandFreq;
+      initial_text = band_edit_buffer;
     }
   } else if (ui_mode == UIMode::STATUS) {
     if (status_edit_idx == 4) {
@@ -3096,6 +3212,13 @@ static void tx_tick() {
 }
 
 static void draw_menu_view() {
+  // Approximate visible capacity per list row on PaperS3 with text size 4:
+  // 39 chars total, with "N " index prefix drawn by ui_draw_list().
+  static constexpr size_t kMenuContentChars = 37;
+  static constexpr size_t kFreeTextMaxChars = kMenuContentChars - 2;    // "F:"
+  static constexpr size_t kCommentMaxChars = kMenuContentChars - 2;     // "C:"
+  static constexpr size_t kActiveBandMaxChars = kMenuContentChars - 11; // "ActiveBand:"
+
   if (menu_long_edit) {
     draw_touch_keyboard_overlay(std::string("Edit: ") + menu_long_buf + "_");
     return;
@@ -3112,7 +3235,7 @@ static void draw_menu_view() {
   else cq_line += cq_type_name(g_cq_type);
   lines.push_back(cq_line);
   lines.push_back("Send FreeText");
-  lines.push_back(std::string("F:") + head_trim(g_free_text, 16));
+  lines.push_back(std::string("F:") + head_trim(g_free_text, kFreeTextMaxChars));
   lines.push_back(std::string("Call:") + elide_right(menu_edit_idx == 3 ? menu_edit_buf : g_call));
   lines.push_back(std::string("Grid:") + elide_right(menu_edit_idx == 4 ? menu_edit_buf : g_grid));
   lines.push_back(std::string("Sleep:") + (M5.Power.isCharging() ? "press" : "USB?"));
@@ -3125,13 +3248,13 @@ static void draw_menu_view() {
   }
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
   lines.push_back(std::string("Antenna:") + elide_right(menu_edit_idx == 9 ? menu_edit_buf : g_ant));
-  lines.push_back(std::string("C:") + head_trim(expand_comment1(), 16));
+  lines.push_back(std::string("C:") + head_trim(expand_comment1(), kCommentMaxChars));
   lines.push_back(battery_status_line());
 
   // Page 2 content (index 12+)
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
-  lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
+  lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, kActiveBandMaxChars));
   // RTC compensation: seconds per 10000 seconds (e.g., +150 = 1.5% fast)
   if (menu_edit_idx == 15) {
     lines.push_back(std::string("RTC Comp:") + menu_edit_buf);
@@ -3139,7 +3262,7 @@ static void draw_menu_view() {
     lines.push_back(std::string("RTC Comp:") + std::to_string(g_rtc_comp));
   }
   lines.push_back("Copy Logs to SD");
-  lines.push_back(menu_delete_confirm ? "Are you sure Y/N?" : "Delete Logs");
+  lines.push_back(menu_delete_confirm ? "Delete Logs? ^:Y v:N" : "Delete Logs");
 
   int highlight_abs = -1;
   int64_t now = rtc_now_ms();
@@ -3173,8 +3296,12 @@ static void draw_menu_view() {
 
 static void draw_status_view() {
   if (status_edit_idx == 4 || status_edit_idx == 5) {
-    const char* label = (status_edit_idx == 4) ? "Date: " : "Time: ";
-    draw_touch_keyboard_overlay(std::string(label) + highlight_pos(status_edit_buffer, status_cursor_pos));
+    const bool is_date = (status_edit_idx == 4);
+    const std::string masked = is_date
+        ? format_date_digits_preview(status_edit_buffer)
+        : format_time_digits_preview(status_edit_buffer);
+    const char* label = is_date ? "Date: " : "Time: ";
+    draw_touch_keyboard_overlay(std::string(label) + masked);
     return;
   }
 
@@ -3810,22 +3937,26 @@ static void enter_mode(UIMode new_mode) {
   rx_flash_idx = -1;
   switch (ui_mode) {
     case UIMode::RX:
+      ui_set_active_mode_button('R');
       ui_draw_mode_box("R");
       // Force RX list redraw
       ui_force_redraw_rx();
       ui_draw_rx();
       break;
     case UIMode::TX:
+      ui_set_active_mode_button('T');
       ui_draw_mode_box("T");
       tx_page = 0;
       redraw_tx_view();
       break;
     case UIMode::BAND:
+      ui_set_active_mode_button('B');
       band_page = 0;
       band_edit_idx = -1;
       draw_band_view();
       break;
     case UIMode::MENU:
+      ui_set_active_mode_button('M');
       ui_draw_mode_box("S");
       menu_page = 0;
       menu_edit_idx = -1;
@@ -3834,10 +3965,12 @@ static void enter_mode(UIMode new_mode) {
       draw_menu_view();
       break;
     case UIMode::DEBUG:
+      ui_set_active_mode_button('D');
       debug_page = (int)((g_debug_lines.size() - 1) / 6);
       ui_draw_debug(g_debug_lines, debug_page);
       break;
     case UIMode::CONTROL:
+      ui_set_active_mode_button('C');
       ui_draw_mode_box("S");
       ui_draw_list(g_ctrl_lines, 0, -1);
       host_input.clear();
@@ -3850,6 +3983,7 @@ static void enter_mode(UIMode new_mode) {
       }
       break;
   case UIMode::HOST:
+    ui_set_active_mode_button(0);
     ui_draw_mode_box("S");
     // Start UAC audio streaming
     g_uac_lines.clear();
@@ -3868,11 +4002,13 @@ static void enter_mode(UIMode new_mode) {
       ui_draw_list(g_uac_lines, 0, -1);
       break;
     case UIMode::LIST:
+      ui_set_active_mode_button(0);
       ui_draw_mode_box("R");
       list_page = 0;
       ui_draw_list(g_list_lines, list_page, -1);
       break;
     case UIMode::QSO:
+      ui_set_active_mode_button('Q');
       ui_draw_mode_box("Q");
       g_q_show_entries = false;
       q_page = 0;
@@ -3880,6 +4016,7 @@ static void enter_mode(UIMode new_mode) {
       ui_draw_list(g_q_lines, q_page, -1);
       break;
     case UIMode::STATUS:
+      ui_set_active_mode_button('S');
       ui_draw_mode_box("S");
       g_status_beacon_temp = g_beacon;
       status_edit_idx = -1;
@@ -3925,6 +4062,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // Prepare RX list (but don't draw yet - startup screen may be shown)
   std::vector<UiRxLine> empty;
   ui_set_rx_list(empty);
+  ui_set_active_mode_button('R');
 
   if (g_startup_active) {
     ui_draw_list(g_startup_lines, 0, -1);
@@ -4159,6 +4297,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   static int last_status_uac = -1; // -1 forces a redraw on first entry
   int cur_uac = uac_is_streaming() ? 1 : 0;
+  const bool c_mode_blocked = control_mode_blocked_by_uac();
+  static int last_c_mode_blocked = -1;
+  if ((c_mode_blocked ? 1 : 0) != last_c_mode_blocked) {
+    ui_set_command_enabled('C', !c_mode_blocked);
+    last_c_mode_blocked = c_mode_blocked ? 1 : 0;
+  }
   if (ui_mode == UIMode::STATUS && cur_uac != last_status_uac) {
     draw_status_view();
   }
@@ -4222,7 +4366,15 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       }
       else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
       else if (c == 'h' || c == 'H') { cancel_status_edit(); enter_mode(ui_mode == UIMode::HOST ? UIMode::RX : UIMode::HOST); switched = true; }
-      else if (c == 'c' || c == 'C') { cancel_status_edit(); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; }
+      else if (c == 'c' || c == 'C') {
+        if (c_mode_blocked) {
+          switched = true;  // C mode disabled while UAC host is connected.
+        } else {
+          cancel_status_edit();
+          enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL);
+          switched = true;
+        }
+      }
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
       else if (c == 'l' || c == 'L') { cancel_status_edit(); enter_mode(ui_mode == UIMode::LIST ? UIMode::RX : UIMode::LIST); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
@@ -4390,8 +4542,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 }
                 draw_status_view();
               }
-              else if (c == '5') { status_edit_idx = 4; status_edit_buffer = g_date; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == '-')) status_cursor_pos++; draw_status_view(); }
-              else if (c == '6') { status_edit_idx = 5; status_edit_buffer = g_time; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == ':')) status_cursor_pos++; draw_status_view(); }
+              else if (c == '5') { status_edit_idx = 4; status_edit_buffer = digits_only_limited(g_date, 8); status_cursor_pos = 0; draw_status_view(); }
+              else if (c == '6') { status_edit_idx = 5; status_edit_buffer = digits_only_limited(g_time, 6); status_cursor_pos = 0; draw_status_view(); }
             } else {
               if (status_edit_idx == 1) {
                 if (c == '`') { status_edit_idx = -1; status_edit_buffer.clear(); draw_status_view(); }
@@ -4560,14 +4712,16 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             }
             if (menu_delete_confirm) {
               // Confirmation prompt for "Delete Logs" (page 2 line 6)
-              if (c == 'Y' || c == 'y') {
+              // Temporary touch-first confirm mapping:
+              // '^' command key -> ';' => YES, 'v' command key -> '.' => NO.
+              if (c == 'Y' || c == 'y' || c == ';') {
                 esp_err_t err = delete_logs_on_spiffs_keep_stationdata();
                 menu_delete_confirm = false;
                 menu_flash_idx = 17; // abs index of line 6 on page 2
                 menu_flash_deadline = rtc_now_ms() + 500;
                 debug_log_line(err == ESP_OK ? "Logs deleted" : "Delete failed");
                 draw_menu_view();
-              } else if (c == 'N' || c == 'n' || c == '`') {
+              } else if (c == 'N' || c == 'n' || c == '.' || c == '`') {
                 menu_delete_confirm = false;
                 draw_menu_view();
               }

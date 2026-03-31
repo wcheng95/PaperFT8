@@ -54,9 +54,11 @@ struct BufferState {
 
 struct VisibleLines {
   static constexpr size_t kRows = 2;
-  static constexpr size_t kCols = 12;
+  static constexpr size_t kMaxCols = 40;
 
-  std::array<std::array<char, kCols + 1>, kRows> lines {};
+  // Number of visible columns currently in use (<= kMaxCols).
+  size_t cols = 12;
+  std::array<std::array<char, kMaxCols + 1>, kRows> lines {};
   size_t cursorLine = 0;
   size_t cursorCol = 0;
   size_t viewportStart = 0;
@@ -85,6 +87,9 @@ struct Config {
   uint32_t repeatPeriodMs = 80;
   uint32_t wordNavAccelerationMs = 1800;
   bool repeatSpace = false;
+  // Edit viewport width in monospace columns. Independent from key layout.
+  // Clamped to [1, VisibleLines::kMaxCols].
+  size_t viewportCols = 12;
 };
 
 class TouchKeyboard {
@@ -166,6 +171,7 @@ class TouchKeyboard {
   size_t snapshotLen_ = 0;
 
   size_t viewportStart_ = 0;
+  size_t viewportCols_ = 12;
   bool editingActive_ = false;
 
   Rect bounds_ {};

@@ -71,6 +71,14 @@ constexpr LayoutEntry kLayout[TouchKeyboard::kLayoutRows][TouchKeyboard::kLayout
 
 TouchKeyboard::TouchKeyboard(IHost& host, IRenderer* renderer, const Config& config)
     : host_(host), renderer_(renderer), config_(config) {
+  if (config_.viewportCols < 1) {
+    viewportCols_ = 1;
+  } else if (config_.viewportCols > VisibleLines::kMaxCols) {
+    viewportCols_ = VisibleLines::kMaxCols;
+  } else {
+    viewportCols_ = config_.viewportCols;
+  }
+
   markAllDirty();
   rebuildKeyRects();
 }
@@ -225,28 +233,31 @@ BufferState TouchKeyboard::bufferState() const {
 
 VisibleLines TouchKeyboard::getVisibleLines() const {
   VisibleLines out;
+  out.cols = viewportCols_;
 
   for (size_t r = 0; r < VisibleLines::kRows; ++r) {
-    for (size_t c = 0; c < VisibleLines::kCols; ++c) {
+    for (size_t c = 0; c < out.cols; ++c) {
       out.lines[r][c] = ' ';
     }
-    out.lines[r][VisibleLines::kCols] = '\0';
+    out.lines[r][out.cols] = '\0';
   }
 
   if (!hasBuffer()) return out;
 
-  const size_t windowSize = VisibleLines::kRows * VisibleLines::kCols;
+  const size_t cols = out.cols;
+  const size_t windowSize = VisibleLines::kRows * cols;
   size_t viewStart = viewportStart_;
   if (cursor_ < viewStart) {
-    viewStart = (cursor_ / VisibleLines::kCols) * VisibleLines::kCols;
+    viewStart = (cursor_ / cols) * cols;
   } else if (cursor_ >= (viewStart + windowSize)) {
-    size_t block = cursor_ / VisibleLines::kCols;
-    viewStart = (block == 0) ? 0 : ((block - 1) * VisibleLines::kCols);
+    size_t block = cursor_ / cols;
+    size_t first_block = (block >= (VisibleLines::kRows - 1)) ? (block - (VisibleLines::kRows - 1)) : 0;
+    viewStart = first_block * cols;
   }
 
   for (size_t r = 0; r < VisibleLines::kRows; ++r) {
-    for (size_t c = 0; c < VisibleLines::kCols; ++c) {
-      size_t src = viewStart + r * VisibleLines::kCols + c;
+    for (size_t c = 0; c < cols; ++c) {
+      size_t src = viewStart + r * cols + c;
       if (src < length_) {
         out.lines[r][c] = buffer_[src];
       }
@@ -256,8 +267,8 @@ VisibleLines TouchKeyboard::getVisibleLines() const {
   out.viewportStart = viewStart;
   if (cursor_ >= viewStart && cursor_ < (viewStart + windowSize)) {
     size_t ofs = cursor_ - viewStart;
-    out.cursorLine = ofs / VisibleLines::kCols;
-    out.cursorCol = ofs % VisibleLines::kCols;
+    out.cursorLine = ofs / cols;
+    out.cursorCol = ofs % cols;
     out.cursorVisible = true;
   }
 
@@ -270,7 +281,7 @@ bool TouchKeyboard::copyVisibleLine(size_t lineIndex, char* out, size_t outCap) 
   }
 
   VisibleLines v = getVisibleLines();
-  size_t n = std::min(VisibleLines::kCols, outCap - 1);
+  size_t n = std::min(v.cols, outCap - 1);
   std::memcpy(out, v.lines[lineIndex].data(), n);
   out[n] = '\0';
   return true;
@@ -518,14 +529,15 @@ void TouchKeyboard::normalizeBufferState() {
 }
 
 void TouchKeyboard::updateViewportForCursor() {
-  const size_t cols = VisibleLines::kCols;
+  const size_t cols = viewportCols_;
   const size_t window = VisibleLines::kRows * cols;
 
   if (cursor_ < viewportStart_) {
     viewportStart_ = (cursor_ / cols) * cols;
   } else if (cursor_ >= (viewportStart_ + window)) {
     size_t block = cursor_ / cols;
-    viewportStart_ = (block == 0) ? 0 : ((block - 1) * cols);
+    size_t first_block = (block >= (VisibleLines::kRows - 1)) ? (block - (VisibleLines::kRows - 1)) : 0;
+    viewportStart_ = first_block * cols;
   }
 }
 

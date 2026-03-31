@@ -37,7 +37,7 @@ Editing semantics:
 - `ENTER`: commit current text, refresh snapshot, and exit.
 
 Text viewport semantics:
-- Monospace model with 2 visible lines and 12 columns.
+- Monospace model with 2 visible lines and configurable columns (`Config::viewportCols`, default `12`).
 - Continuous backing buffer with scrolling viewport.
 - Cursor visibility maintained by viewport logic.
 
@@ -47,6 +47,7 @@ Text viewport semantics:
 - `setBounds(int16_t x, int16_t y, int16_t w, int16_t h)`
 - `onTouchDown(...)`, `onTouchMove(...)`, `onTouchUp(...)`
 - `tick()` for repeat timing
+- `Config::viewportCols` controls edit-window wrap width (independent of 4x12 key grid)
 - `drawAll()`, `redrawDirty()`
 - `getVisibleLines()`, `copyVisibleLine(...)`
 - `commitEdit()`, `cancelEdit()`

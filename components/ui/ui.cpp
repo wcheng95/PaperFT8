@@ -1,8 +1,11 @@
 #include "ui.h"
 #include <M5Unified.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include "esp_timer.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -15,10 +18,12 @@ static constexpr int kTextFirstLineIdx = 1;
 static constexpr int kCommandLineIdx = 7;
 static constexpr int kCommandButtons = 12;
 
-static constexpr int kModeTextSize = 2;
 static constexpr int kBodyTextSize = 4;
 static constexpr int kCommandTextSize = 3;
 static constexpr int kTextLeftPx = 24;
+static constexpr int kWaterfallCols = 240;
+static constexpr int kWaterfallRows = 24;
+static constexpr int64_t kWaterfallDrawMinMs = 700;
 
 static constexpr uint16_t UI_BG = TFT_WHITE;
 static constexpr uint16_t UI_FG = TFT_BLACK;
@@ -26,10 +31,33 @@ static constexpr uint16_t UI_FG = TFT_BLACK;
 static const char* kCommandLabels[kCommandButtons] = {
     "12", "ESC", "S", "R", "T", "Q", "M", "B", "C", "D", "^", "v"
 };
+static constexpr int kCmdIdxS = 2;
+static constexpr int kCmdIdxR = 3;
+static constexpr int kCmdIdxT = 4;
+static constexpr int kCmdIdxQ = 5;
+static constexpr int kCmdIdxM = 6;
+static constexpr int kCmdIdxB = 7;
+static constexpr int kCmdIdxC = 8;
+static constexpr int kCmdIdxD = 9;
 
 static bool ui_paused = false;
 static UiLayout g_layout;
 static int g_y_offset = 0;
+static int g_active_mode_button = -1;
+static bool g_command_enabled[kCommandButtons] = {
+    true, true, true, true, true, true, true, true, true, true, true, true
+};
+static bool g_header_widgets_enabled = true;
+static bool g_countdown_enabled = false;  // runtime toggle via command button 0
+
+static bool g_countdown_even = true;
+static int g_countdown_second = 0;  // 0..12 within 15s slot
+
+static uint8_t g_waterfall_ring[kWaterfallRows][kWaterfallCols] = {};
+static int g_waterfall_head = 0;  // next write row
+static bool g_waterfall_has_data = false;
+static bool g_waterfall_dirty_flag = false;
+static int64_t g_waterfall_last_draw_ms = 0;
 
 static std::vector<UiRxLine> rx_lines;
 static int rx_page = 0;
@@ -38,6 +66,7 @@ static std::vector<UiRxLine> last_drawn_lines;
 static int last_page = -1;
 
 static SemaphoreHandle_t g_disp_mutex = nullptr;
+static SemaphoreHandle_t g_wf_mutex = nullptr;
 static TaskHandle_t g_disp_task = nullptr;
 static volatile bool g_display_pending = false;
 
@@ -57,6 +86,25 @@ struct DispGuard {
     DispGuard() { disp_lock(); }
     ~DispGuard() { disp_unlock(); }
 };
+
+static int64_t now_ms() {
+    return esp_timer_get_time() / 1000;
+}
+
+static int command_index_from_key(char key) {
+    char k = static_cast<char>(std::toupper(static_cast<unsigned char>(key)));
+    switch (k) {
+        case 'S': return kCmdIdxS;
+        case 'R': return kCmdIdxR;
+        case 'T': return kCmdIdxT;
+        case 'Q': return kCmdIdxQ;
+        case 'M': return kCmdIdxM;
+        case 'B': return kCmdIdxB;
+        case 'C': return kCmdIdxC;
+        case 'D': return kCmdIdxD;
+        default: return -1;
+    }
+}
 
 static void request_display_flush() {
     if (!g_disp_task) {
@@ -90,11 +138,65 @@ static void draw_row_frame(int line_idx) {
 }
 
 static void draw_mode_row(const char* text) {
+    (void)text;
     draw_row_frame(kTopLineIdx);
-    M5.Display.setTextColor(UI_FG, UI_BG);
-    M5.Display.setTextDatum(middle_left);
-    M5.Display.setTextSize(kModeTextSize);
-    M5.Display.drawString(text ? text : "", 8, line_y(kTopLineIdx) + (kLineHeightPx / 2));
+}
+
+static void draw_countdown_locked() {
+    // Countdown is rendered in command button 0.
+}
+
+static void scale_bins_to_waterfall_cols(uint8_t* dst, const uint8_t* src, int len) {
+    if (!dst) return;
+    std::memset(dst, 0, kWaterfallCols);
+    if (!src || len <= 0) return;
+    if (len == kWaterfallCols) {
+        std::memcpy(dst, src, kWaterfallCols);
+        return;
+    }
+    for (int x = 0; x < kWaterfallCols; ++x) {
+        int start = (int)((int64_t)x * len / kWaterfallCols);
+        int end = (int)((int64_t)(x + 1) * len / kWaterfallCols);
+        if (end <= start) end = start + 1;
+        uint8_t v = 0;
+        for (int i = start; i < end && i < len; ++i) {
+            if (src[i] > v) v = src[i];
+        }
+        dst[x] = v;
+    }
+}
+
+static void draw_waterfall_locked(const uint8_t rows[kWaterfallRows][kWaterfallCols],
+                                  int head,
+                                  bool has_data) {
+    if (!g_header_widgets_enabled) return;
+    const UiRect& r = g_layout.waterfall;
+    if (r.w <= 2 || r.h <= 2) return;
+
+    M5.Display.fillRect(r.x, r.y, r.w, r.h, UI_BG);
+    M5.Display.drawRect(r.x, r.y, r.w, r.h, UI_FG);
+    if (!has_data) return;
+
+    const int inner_w = r.w - 2;
+    const int inner_h = r.h - 2;
+    if (inner_w <= 0 || inner_h <= 0) return;
+
+    for (int y = 0; y < inner_h; ++y) {
+        int y_from_bottom = inner_h - 1 - y;
+        int src_row_back = (int)((int64_t)y_from_bottom * kWaterfallRows / inner_h);
+        int src_row = (head - 1 - src_row_back + kWaterfallRows) % kWaterfallRows;
+        for (int x = 0; x < inner_w; ++x) {
+            int src_col = (int)((int64_t)x * kWaterfallCols / inner_w);
+            uint8_t v = rows[src_row][src_col];
+            bool on = false;
+            if (v >= 180) on = true;
+            else if (v >= 145) on = (((x + y) & 1) == 0);
+            else if (v >= 115) on = (((x ^ y) & 3) == 0);
+            if (on) {
+                M5.Display.drawPixel(r.x + 1 + x, r.y + 1 + y, UI_FG);
+            }
+        }
+    }
 }
 
 static void draw_text_row(int row_idx, const char* text, bool outline) {
@@ -121,13 +223,40 @@ static void draw_command_button_locked(int button_idx) {
     const int w = x1 - x0;
     const int row_y = line_y(kCommandLineIdx);
 
-    M5.Display.fillRect(x0, row_y, w, kLineHeightPx, UI_BG);
+    if (button_idx == 0 && g_countdown_enabled) {
+        const bool odd = !g_countdown_even;
+        const uint16_t bg = odd ? UI_FG : UI_BG;
+        const uint16_t fg = odd ? UI_BG : UI_FG;
+        M5.Display.fillRect(x0, row_y, w, kLineHeightPx, bg);
+        M5.Display.drawRect(x0, row_y, w, kLineHeightPx, UI_FG);
+        M5.Display.setTextColor(fg, bg);
+        M5.Display.setTextDatum(middle_center);
+        M5.Display.setTextSize(kCommandTextSize);
+        char label[4];
+        std::snprintf(label, sizeof(label), "%d", g_countdown_second);
+        M5.Display.drawString(label, x0 + (w / 2), row_y + (kLineHeightPx / 2));
+        return;
+    }
+
+    const bool active = (button_idx == g_active_mode_button);
+    const bool enabled = g_command_enabled[button_idx];
+    const uint16_t bg = active ? UI_FG : UI_BG;
+    const uint16_t fg = active ? UI_BG : UI_FG;
+
+    M5.Display.fillRect(x0, row_y, w, kLineHeightPx, bg);
     M5.Display.drawRect(x0, row_y, w, kLineHeightPx, UI_FG);
 
-    M5.Display.setTextColor(UI_FG, UI_BG);
+    M5.Display.setTextColor(fg, bg);
     M5.Display.setTextDatum(middle_center);
     M5.Display.setTextSize(kCommandTextSize);
     M5.Display.drawString(kCommandLabels[button_idx], x0 + (w / 2), row_y + (kLineHeightPx / 2));
+    if (!enabled) {
+        const int slash_y = row_y + (kLineHeightPx / 2);
+        const int slash_w = std::max(0, w - 8);
+        if (slash_w > 0) {
+            M5.Display.drawFastHLine(x0 + 4, slash_y, slash_w, UI_FG);
+        }
+    }
 }
 
 static void draw_command_bar_locked() {
@@ -141,11 +270,9 @@ const UiLayout& ui_layout() { return g_layout; }
 void ui_set_paused(bool paused) { ui_paused = paused; }
 bool ui_is_paused() { return ui_paused; }
 
-bool ui_waterfall_dirty() { return false; }
-void ui_draw_waterfall_if_dirty() {}
-
 void ui_init() {
     g_disp_mutex = xSemaphoreCreateMutex();
+    g_wf_mutex = xSemaphoreCreateMutex();
     BaseType_t ret = xTaskCreatePinnedToCore(ui_display_task, "ui_display", 3072, nullptr, 1, &g_disp_task, 0);
     if (ret != pdPASS) {
         g_disp_task = nullptr;
@@ -169,11 +296,22 @@ void ui_init() {
     g_layout.mode_box = {0, line_y(kTopLineIdx), g_layout.screen_w, kLineHeightPx};
     g_layout.text_area = {0, line_y(kTextFirstLineIdx), g_layout.screen_w, kLineHeightPx * RX_LINES};
     g_layout.command_bar = {0, line_y(kCommandLineIdx), g_layout.screen_w, kLineHeightPx};
-    g_layout.waterfall = {0, 0, 0, 0};
-    g_layout.countdown = {0, 0, 0, 0};
+    {
+        const int row_y = line_y(kTopLineIdx);
+        const int cd_w = std::max(190, g_layout.screen_w / 4);
+        g_layout.countdown = {g_layout.screen_w - cd_w - 8, row_y + 4, cd_w, 26};
+        const int wf_x = std::min(120, g_layout.screen_w / 6);
+        const int wf_y = row_y + 34;
+        int wf_w = g_layout.screen_w - wf_x - 8;
+        if (wf_w < 16) wf_w = 16;
+        int wf_h = (row_y + kLineHeightPx) - wf_y - 4;
+        if (wf_h < 8) wf_h = 8;
+        g_layout.waterfall = {wf_x, wf_y, wf_w, wf_h};
+    }
     g_layout.line_h = kLineHeightPx;
 
     draw_mode_row("");
+    draw_countdown_locked();
     for (int i = 0; i < RX_LINES; ++i) {
         draw_text_row(i, "", false);
     }
@@ -182,24 +320,78 @@ void ui_init() {
 }
 
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
-    (void)row;
-    (void)bins;
-    (void)len;
+    if (row < 0 || !bins || len <= 0 || !g_wf_mutex) return;
+    if (xSemaphoreTake(g_wf_mutex, 0) != pdTRUE) return;
+    const int idx = row % kWaterfallRows;
+    scale_bins_to_waterfall_cols(g_waterfall_ring[idx], bins, len);
+    g_waterfall_has_data = true;
+    g_waterfall_dirty_flag = true;
+    xSemaphoreGive(g_wf_mutex);
 }
 
 void ui_push_waterfall_row(const uint8_t* bins, int len) {
-    (void)bins;
-    (void)len;
+    if (!bins || len <= 0 || !g_wf_mutex) return;
+    if (xSemaphoreTake(g_wf_mutex, 0) != pdTRUE) return;
+    scale_bins_to_waterfall_cols(g_waterfall_ring[g_waterfall_head], bins, len);
+    g_waterfall_head = (g_waterfall_head + 1) % kWaterfallRows;
+    g_waterfall_has_data = true;
+    g_waterfall_dirty_flag = true;
+    xSemaphoreGive(g_wf_mutex);
 }
 
-void ui_clear_waterfall() {}
+void ui_clear_waterfall() {
+    if (!g_wf_mutex) return;
+    if (xSemaphoreTake(g_wf_mutex, portMAX_DELAY) == pdTRUE) {
+        std::memset(g_waterfall_ring, 0, sizeof(g_waterfall_ring));
+        g_waterfall_head = 0;
+        g_waterfall_has_data = false;
+        g_waterfall_dirty_flag = false;
+        xSemaphoreGive(g_wf_mutex);
+    }
+    if (!g_header_widgets_enabled) return;
+    DispGuard guard;
+    draw_waterfall_locked(g_waterfall_ring, g_waterfall_head, false);
+    request_display_flush();
+}
 
-void ui_draw_waterfall() {}
+void ui_draw_waterfall() {
+    if (!g_header_widgets_enabled || !g_wf_mutex) return;
+    static uint8_t snapshot[kWaterfallRows][kWaterfallCols];
+    int head = 0;
+    bool has_data = false;
+    if (xSemaphoreTake(g_wf_mutex, 0) != pdTRUE) return;
+    std::memcpy(snapshot, g_waterfall_ring, sizeof(snapshot));
+    head = g_waterfall_head;
+    has_data = g_waterfall_has_data;
+    g_waterfall_dirty_flag = false;
+    g_waterfall_last_draw_ms = now_ms();
+    xSemaphoreGive(g_wf_mutex);
+
+    DispGuard guard;
+    draw_waterfall_locked(snapshot, head, has_data);
+    request_display_flush();
+}
 
 void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
-    (void)fraction;
-    (void)even_slot;
     (void)offset_hz;
+    if (fraction < 0.0f) fraction = 0.0f;
+    if (fraction > 1.0f) fraction = 1.0f;
+
+    int sec = static_cast<int>(fraction * 15.0f);
+    if (sec < 0) sec = 0;
+    if (sec > 12) sec = 12;
+
+    const bool changed = (g_countdown_even != even_slot) ||
+                         (g_countdown_second != sec);
+    if (!changed) return;
+
+    g_countdown_even = even_slot;
+    g_countdown_second = sec;
+
+    if (!g_countdown_enabled) return;
+    DispGuard guard;
+    draw_command_button_locked(0);
+    request_display_flush();
 }
 
 void ui_set_rx_list(const std::vector<UiRxLine>& lines) {
@@ -217,7 +409,10 @@ void ui_force_redraw_rx() {
 
 static void draw_rx_line(int row_idx, const UiRxLine& l, int line_no, bool selected) {
     char buf[160];
-    std::snprintf(buf, sizeof(buf), "%d %s", line_no, l.text.c_str());
+    // Format: "<line> <freq(4)> <snr(3)> <message>"
+    // freq is right-aligned/padded to 4 chars; SNR is always signed 3 chars.
+    std::snprintf(buf, sizeof(buf), "%d %4d %+03d %s",
+                  line_no, l.offset_hz, l.snr, l.text.c_str());
     draw_text_row(row_idx, buf, selected);
 }
 
@@ -227,6 +422,8 @@ void ui_draw_rx(int flash_index) {
             bool same = true;
             for (size_t i = 0; i < rx_lines.size(); ++i) {
                 if (rx_lines[i].text != last_drawn_lines[i].text ||
+                    rx_lines[i].snr != last_drawn_lines[i].snr ||
+                    rx_lines[i].offset_hz != last_drawn_lines[i].offset_hz ||
                     rx_lines[i].is_cq != last_drawn_lines[i].is_cq ||
                     rx_lines[i].is_to_me != last_drawn_lines[i].is_to_me) {
                     same = false;
@@ -319,21 +516,82 @@ void ui_draw_debug(const std::vector<std::string>& lines, int page) {
 }
 
 void ui_draw_mode_box(const char* mode_label) {
+    (void)mode_label;
     DispGuard guard;
-    draw_mode_row(mode_label ? mode_label : "");
+    g_header_widgets_enabled = true;
+    draw_mode_row("");
+    if (g_header_widgets_enabled) {
+        draw_countdown_locked();
+    }
     request_display_flush();
 }
 
 int ui_command_hit_test(int x, int y) {
     const UiRect& bar = g_layout.command_bar;
     if (!bar.contains(x, y)) return -1;
-    return (x * kCommandButtons) / g_layout.screen_w;
+    int idx = (x * kCommandButtons) / g_layout.screen_w;
+    if (idx < 0 || idx >= kCommandButtons) return -1;
+    if (!g_command_enabled[idx]) return -1;
+    return idx;
 }
 
 void ui_draw_command_bar() {
     DispGuard guard;
     draw_command_bar_locked();
     request_display_flush();
+}
+
+void ui_set_active_mode_button(char mode_key) {
+    int idx = command_index_from_key(mode_key);
+
+    if (idx == g_active_mode_button) return;
+    g_active_mode_button = idx;
+
+    DispGuard guard;
+    draw_command_bar_locked();
+    request_display_flush();
+}
+
+void ui_set_countdown_enabled(bool enabled) {
+    if (g_countdown_enabled == enabled) return;
+    g_countdown_enabled = enabled;
+    DispGuard guard;
+    draw_command_button_locked(0);
+    request_display_flush();
+}
+
+void ui_toggle_countdown_enabled() {
+    ui_set_countdown_enabled(!g_countdown_enabled);
+}
+
+bool ui_is_countdown_enabled() {
+    return g_countdown_enabled;
+}
+
+void ui_set_command_enabled(char command_key, bool enabled) {
+    int idx = command_index_from_key(command_key);
+    if (idx < 0 || idx >= kCommandButtons) return;
+    if (g_command_enabled[idx] == enabled) return;
+    g_command_enabled[idx] = enabled;
+    if (!enabled && g_active_mode_button == idx) {
+        g_active_mode_button = -1;
+    }
+
+    DispGuard guard;
+    draw_command_bar_locked();
+    request_display_flush();
+}
+
+bool ui_waterfall_dirty() {
+    return g_waterfall_dirty_flag;
+}
+
+void ui_draw_waterfall_if_dirty() {
+    if (!g_header_widgets_enabled) return;
+    if (!g_waterfall_dirty_flag) return;
+    const int64_t t = now_ms();
+    if ((t - g_waterfall_last_draw_ms) < kWaterfallDrawMinMs) return;
+    ui_draw_waterfall();
 }
 
 void ui_draw_tx(const std::string& next,
