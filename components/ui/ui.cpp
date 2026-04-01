@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
-#include "esp_timer.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -21,9 +20,26 @@ static constexpr int kCommandButtons = 12;
 static constexpr int kBodyTextSize = 4;
 static constexpr int kCommandTextSize = 3;
 static constexpr int kTextLeftPx = 24;
-static constexpr int kWaterfallCols = 240;
-static constexpr int kWaterfallRows = 24;
-static constexpr int64_t kWaterfallDrawMinMs = 700;
+
+/*
+ * ePaper-friendly waterfall:
+ * - Fixed 896x33 area, split into three 896x11 snapshot bands.
+ * - One band update at ~4s, ~8s, ~12s in each 15s FT8 slot.
+ * - Each update refreshes only the target 896x11 rectangle.
+ * - Set kWaterfallSnapshotsEnabled=false to disable quickly.
+ */
+static constexpr bool kWaterfallSnapshotsEnabled = true;
+static constexpr int kWaterfallWidth = 896;
+static constexpr int kWaterfallBandHeight = 11;
+static constexpr int kWaterfallBandCount = 3;
+static constexpr int kWaterfallTotalHeight = kWaterfallBandHeight * kWaterfallBandCount;
+static constexpr int kWaterfallRowBytes = kWaterfallWidth / 8;  // 112
+static constexpr int kWaterfallBandBitmapBytes = kWaterfallRowBytes * kWaterfallBandHeight;  // 1232
+static constexpr int kWaterfallSnapshotTopSec = 4;
+static constexpr int kWaterfallSnapshotMidSec = 8;
+static constexpr int kWaterfallSnapshotBotSec = 12;
+static constexpr int kWaterfallRecentRows = 16;  // keep recent samples for one snapshot build
+
 static constexpr int kWaterfallFreqMinHz = 200;
 static constexpr int kWaterfallFreqMaxHz = 3000;
 static constexpr int kWaterfallMarksHz[] = {500, 1000, 1500, 2000, 2500};
@@ -51,18 +67,19 @@ static bool g_command_enabled[kCommandButtons] = {
     true, true, true, true, true, true, true, true, true, true, true, true
 };
 static bool g_header_widgets_enabled = true;
-static bool g_countdown_enabled = false;  // runtime toggle via command button 0
+static bool g_countdown_enabled = true;  // runtime toggle via command button 0
 
 static bool g_countdown_even = true;
 static int g_countdown_second = 0;  // 0..12 within 15s slot
 static bool g_countdown_visual_initialized = false;
 static bool g_countdown_visual_odd = false;
 
-static uint8_t g_waterfall_ring[kWaterfallRows][kWaterfallCols] = {};
-static int g_waterfall_head = 0;  // next write row
-static bool g_waterfall_has_data = false;
-static bool g_waterfall_dirty_flag = false;
-static int64_t g_waterfall_last_draw_ms = 0;
+static uint8_t g_waterfall_recent[kWaterfallRecentRows][kWaterfallWidth] = {};
+static int g_waterfall_recent_head = 0;   // next write row
+static int g_waterfall_recent_count = 0;  // valid rows in recent ring
+static int g_waterfall_slot_parity = -1;  // 0 even / 1 odd
+static bool g_waterfall_band_done[kWaterfallBandCount] = {false, false, false};
+static uint8_t g_waterfall_band_bitmap[kWaterfallBandBitmapBytes] = {};
 
 static std::vector<UiRxLine> rx_lines;
 static int rx_page = 0;
@@ -91,10 +108,6 @@ struct DispGuard {
     DispGuard() { disp_lock(); }
     ~DispGuard() { disp_unlock(); }
 };
-
-static int64_t now_ms() {
-    return esp_timer_get_time() / 1000;
-}
 
 static int command_index_from_key(char key) {
     char k = static_cast<char>(std::toupper(static_cast<unsigned char>(key)));
@@ -199,17 +212,17 @@ static void draw_countdown_locked() {
     // Countdown is rendered in command button 0.
 }
 
-static void scale_bins_to_waterfall_cols(uint8_t* dst, const uint8_t* src, int len) {
+static void scale_bins_to_waterfall_width(uint8_t* dst, const uint8_t* src, int len) {
     if (!dst) return;
-    std::memset(dst, 0, kWaterfallCols);
+    std::memset(dst, 0, kWaterfallWidth);
     if (!src || len <= 0) return;
-    if (len == kWaterfallCols) {
-        std::memcpy(dst, src, kWaterfallCols);
+    if (len == kWaterfallWidth) {
+        std::memcpy(dst, src, kWaterfallWidth);
         return;
     }
-    for (int x = 0; x < kWaterfallCols; ++x) {
-        int start = (int)((int64_t)x * len / kWaterfallCols);
-        int end = (int)((int64_t)(x + 1) * len / kWaterfallCols);
+    for (int x = 0; x < kWaterfallWidth; ++x) {
+        int start = (int)((int64_t)x * len / kWaterfallWidth);
+        int end = (int)((int64_t)(x + 1) * len / kWaterfallWidth);
         if (end <= start) end = start + 1;
         uint8_t v = 0;
         for (int i = start; i < end && i < len; ++i) {
@@ -219,34 +232,80 @@ static void scale_bins_to_waterfall_cols(uint8_t* dst, const uint8_t* src, int l
     }
 }
 
-static void draw_waterfall_locked(const uint8_t rows[kWaterfallRows][kWaterfallCols],
-                                  int head,
-                                  bool has_data) {
-    if (!g_header_widgets_enabled) return;
-    const UiRect& r = g_layout.waterfall;
-    if (r.w <= 0 || r.h <= 0) return;
+static bool waterfall_pixel_on(uint8_t v, int x, int y) {
+    if (v >= 180) return true;
+    if (v >= 145) return ((x + y) & 1) == 0;
+    if (v >= 115) return ((x ^ y) & 3) == 0;
+    return false;
+}
 
-    M5.Display.fillRect(r.x, r.y, r.w, r.h, UI_BG);
-    if (!has_data) return;
+static bool build_waterfall_band_bitmap_locked() {
+    std::memset(g_waterfall_band_bitmap, 0, sizeof(g_waterfall_band_bitmap));
+    if (!kWaterfallSnapshotsEnabled) return true;
+    if (!g_wf_mutex) return false;
+    if (xSemaphoreTake(g_wf_mutex, 0) != pdTRUE) return false;
 
-    const int inner_w = r.w;
-    const int inner_h = r.h;
-    if (inner_w <= 0 || inner_h <= 0) return;
-
-    for (int y = 0; y < inner_h; ++y) {
-        int y_from_bottom = inner_h - 1 - y;
-        int src_row_back = (int)((int64_t)y_from_bottom * kWaterfallRows / inner_h);
-        int src_row = (head - 1 - src_row_back + kWaterfallRows) % kWaterfallRows;
-        for (int x = 0; x < inner_w; ++x) {
-            int src_col = (int)((int64_t)x * kWaterfallCols / inner_w);
-            uint8_t v = rows[src_row][src_col];
-            bool on = false;
-            if (v >= 180) on = true;
-            else if (v >= 145) on = (((x + y) & 1) == 0);
-            else if (v >= 115) on = (((x ^ y) & 3) == 0);
-            if (on) {
-                M5.Display.drawPixel(r.x + x, r.y + y, UI_FG);
+    const int count = g_waterfall_recent_count;
+    const int head = g_waterfall_recent_head;
+    for (int y = 0; y < kWaterfallBandHeight; ++y) {
+        const int back = (kWaterfallBandHeight - 1) - y;  // newest sample at bottom row
+        if (back >= count) continue;
+        const int src_idx = (head - 1 - back + kWaterfallRecentRows) % kWaterfallRecentRows;
+        const uint8_t* src = g_waterfall_recent[src_idx];
+        uint8_t* dst = g_waterfall_band_bitmap + (y * kWaterfallRowBytes);
+        for (int x = 0; x < kWaterfallWidth; ++x) {
+            if (waterfall_pixel_on(src[x], x, y)) {
+                dst[x >> 3] |= static_cast<uint8_t>(0x80u >> (x & 7));
             }
+        }
+    }
+
+    xSemaphoreGive(g_wf_mutex);
+    return true;
+}
+
+static bool draw_waterfall_snapshot_band(int band_idx) {
+    if (!kWaterfallSnapshotsEnabled) return false;
+    if (!g_header_widgets_enabled) return false;
+    if (band_idx < 0 || band_idx >= kWaterfallBandCount) return false;
+    const UiRect& r = g_layout.waterfall;
+    if (r.w != kWaterfallWidth || r.h != kWaterfallTotalHeight) return false;
+
+    if (!build_waterfall_band_bitmap_locked()) return false;
+
+    const int x = r.x;
+    const int y = r.y + band_idx * kWaterfallBandHeight;
+    DispGuard guard;
+    M5.Display.drawBitmap(x, y, g_waterfall_band_bitmap, kWaterfallWidth, kWaterfallBandHeight, UI_FG, UI_BG);
+    M5.Display.display(x, y, kWaterfallWidth, kWaterfallBandHeight);
+    return true;
+}
+
+static void waterfall_snapshot_tick(int slot_sec, bool even_slot) {
+    if (!kWaterfallSnapshotsEnabled) return;
+    const int slot_parity = even_slot ? 0 : 1;
+    if (slot_parity != g_waterfall_slot_parity) {
+        g_waterfall_slot_parity = slot_parity;
+        for (int i = 0; i < kWaterfallBandCount; ++i) {
+            g_waterfall_band_done[i] = false;
+        }
+    }
+
+    struct SnapDef {
+        int sec;
+        int band_idx;
+    };
+    static constexpr SnapDef kSnaps[kWaterfallBandCount] = {
+        {kWaterfallSnapshotTopSec, 0},
+        {kWaterfallSnapshotMidSec, 1},
+        {kWaterfallSnapshotBotSec, 2},
+    };
+
+    for (const auto& s : kSnaps) {
+        if (slot_sec < s.sec) continue;
+        if (g_waterfall_band_done[s.band_idx]) continue;
+        if (draw_waterfall_snapshot_band(s.band_idx)) {
+            g_waterfall_band_done[s.band_idx] = true;
         }
     }
 }
@@ -380,12 +439,10 @@ void ui_init() {
         const int row_y = line_y(kTopLineIdx);
         const int cd_w = std::max(190, g_layout.screen_w / 4);
         g_layout.countdown = {g_layout.screen_w - cd_w - 8, row_y + 4, cd_w, 26};
-        const int wf_x = 0;
-        const int wf_y = row_y + 34;
-        int wf_w = g_layout.screen_w;
-        if (wf_w < 16) wf_w = 16;
-        int wf_h = (row_y + kLineHeightPx) - wf_y - 4;
-        if (wf_h < 8) wf_h = 8;
+        const int wf_w = (g_layout.screen_w >= kWaterfallWidth) ? kWaterfallWidth : (g_layout.screen_w & ~7);
+        const int wf_h = kWaterfallTotalHeight;
+        const int wf_x = (g_layout.screen_w - wf_w) / 2;
+        const int wf_y = row_y + (kLineHeightPx - wf_h);
         g_layout.waterfall = {wf_x, wf_y, wf_w, wf_h};
     }
     g_layout.line_h = kLineHeightPx;
@@ -400,56 +457,43 @@ void ui_init() {
 }
 
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
-    if (row < 0 || !bins || len <= 0 || !g_wf_mutex) return;
-    if (xSemaphoreTake(g_wf_mutex, 0) != pdTRUE) return;
-    const int idx = row % kWaterfallRows;
-    scale_bins_to_waterfall_cols(g_waterfall_ring[idx], bins, len);
-    g_waterfall_has_data = true;
-    g_waterfall_dirty_flag = true;
-    xSemaphoreGive(g_wf_mutex);
+    (void)row;
+    ui_push_waterfall_row(bins, len);
 }
 
 void ui_push_waterfall_row(const uint8_t* bins, int len) {
+    if (!kWaterfallSnapshotsEnabled) return;
     if (!bins || len <= 0 || !g_wf_mutex) return;
     if (xSemaphoreTake(g_wf_mutex, 0) != pdTRUE) return;
-    scale_bins_to_waterfall_cols(g_waterfall_ring[g_waterfall_head], bins, len);
-    g_waterfall_head = (g_waterfall_head + 1) % kWaterfallRows;
-    g_waterfall_has_data = true;
-    g_waterfall_dirty_flag = true;
+    scale_bins_to_waterfall_width(g_waterfall_recent[g_waterfall_recent_head], bins, len);
+    g_waterfall_recent_head = (g_waterfall_recent_head + 1) % kWaterfallRecentRows;
+    if (g_waterfall_recent_count < kWaterfallRecentRows) {
+        ++g_waterfall_recent_count;
+    }
     xSemaphoreGive(g_wf_mutex);
 }
 
 void ui_clear_waterfall() {
     if (!g_wf_mutex) return;
     if (xSemaphoreTake(g_wf_mutex, portMAX_DELAY) == pdTRUE) {
-        std::memset(g_waterfall_ring, 0, sizeof(g_waterfall_ring));
-        g_waterfall_head = 0;
-        g_waterfall_has_data = false;
-        g_waterfall_dirty_flag = false;
+        std::memset(g_waterfall_recent, 0, sizeof(g_waterfall_recent));
+        g_waterfall_recent_head = 0;
+        g_waterfall_recent_count = 0;
+        g_waterfall_slot_parity = -1;
+        for (int i = 0; i < kWaterfallBandCount; ++i) {
+            g_waterfall_band_done[i] = false;
+        }
+        std::memset(g_waterfall_band_bitmap, 0, sizeof(g_waterfall_band_bitmap));
         xSemaphoreGive(g_wf_mutex);
     }
     if (!g_header_widgets_enabled) return;
     DispGuard guard;
-    draw_waterfall_locked(g_waterfall_ring, g_waterfall_head, false);
-    request_display_flush();
+    M5.Display.fillRect(g_layout.waterfall.x, g_layout.waterfall.y, g_layout.waterfall.w, g_layout.waterfall.h, UI_BG);
+    M5.Display.display(g_layout.waterfall.x, g_layout.waterfall.y, g_layout.waterfall.w, g_layout.waterfall.h);
 }
 
 void ui_draw_waterfall() {
-    if (!g_header_widgets_enabled || !g_wf_mutex) return;
-    static uint8_t snapshot[kWaterfallRows][kWaterfallCols];
-    int head = 0;
-    bool has_data = false;
-    if (xSemaphoreTake(g_wf_mutex, 0) != pdTRUE) return;
-    std::memcpy(snapshot, g_waterfall_ring, sizeof(snapshot));
-    head = g_waterfall_head;
-    has_data = g_waterfall_has_data;
-    g_waterfall_dirty_flag = false;
-    g_waterfall_last_draw_ms = now_ms();
-    xSemaphoreGive(g_wf_mutex);
-
-    DispGuard guard;
-    draw_waterfall_locked(snapshot, head, has_data);
-    request_display_flush();
+    // Legacy entry point: waterfall is now updated only by 3 snapshot events per slot.
 }
 
 void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
@@ -457,8 +501,12 @@ void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
     if (fraction < 0.0f) fraction = 0.0f;
     if (fraction > 1.0f) fraction = 1.0f;
 
-    int sec = static_cast<int>(fraction * 15.0f);
-    if (sec < 0) sec = 0;
+    int slot_sec = static_cast<int>(fraction * 15.0f);
+    if (slot_sec < 0) slot_sec = 0;
+    if (slot_sec > 14) slot_sec = 14;
+    waterfall_snapshot_tick(slot_sec, even_slot);
+
+    int sec = slot_sec;
     if (sec > 12) sec = 12;
 
     const bool changed = (g_countdown_even != even_slot) ||
@@ -663,15 +711,11 @@ void ui_set_command_enabled(char command_key, bool enabled) {
 }
 
 bool ui_waterfall_dirty() {
-    return g_waterfall_dirty_flag;
+    return false;
 }
 
 void ui_draw_waterfall_if_dirty() {
-    if (!g_header_widgets_enabled) return;
-    if (!g_waterfall_dirty_flag) return;
-    const int64_t t = now_ms();
-    if ((t - g_waterfall_last_draw_ms) < kWaterfallDrawMinMs) return;
-    ui_draw_waterfall();
+    // Legacy entry point kept for call-site compatibility.
 }
 
 void ui_draw_tx(const std::string& next,

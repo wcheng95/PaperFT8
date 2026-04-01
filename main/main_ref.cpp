@@ -2114,7 +2114,7 @@ static void advance_active_band(int delta) {
 
 static void fft_waterfall_tx_tone(uint8_t tone) {
   // Map tone 0-7 to screen width and push a bright bin
-  std::array<uint8_t, 240> row{};
+  std::array<uint8_t, 896> row{};
   int pos = (int)((tone * row.size()) / 8);
   if (pos < 0) pos = 0;
   if (pos >= (int)row.size()) pos = (int)row.size() - 1;

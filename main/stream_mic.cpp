@@ -28,6 +28,7 @@ static void push_waterfall_latest(const monitor_t& mon) {
   if (mon.wf.num_blocks <= 0 || mon.wf.mag == nullptr) return;
   const int block = mon.wf.num_blocks - 1;
   const int num_bins = mon.wf.num_bins;
+  if (num_bins <= 0) return;
   const int freq_osr = mon.wf.freq_osr;
   const uint8_t* base = mon.wf.mag + block * mon.wf.block_stride;
 
@@ -42,21 +43,7 @@ static void push_waterfall_latest(const monitor_t& mon) {
     collapsed[b] = v;
   }
 
-  constexpr int width = 240;
-  static std::vector<uint8_t> scaled;
-  scaled.assign(width, 0);
-  for (int x = 0; x < width; ++x) {
-    int start = (int)((int64_t)x * num_bins / width);
-    int end = (int)((int64_t)(x + 1) * num_bins / width);
-    if (end <= start) end = start + 1;
-    uint8_t maxv = 0;
-    for (int s = start; s < end && s < num_bins; ++s) {
-      if (collapsed[s] > maxv) maxv = collapsed[s];
-    }
-    scaled[x] = maxv;
-  }
-
-  ui_push_waterfall_row(scaled.data(), width);
+  ui_push_waterfall_row(collapsed.data(), num_bins);
 }
 
 void stream_mic_task(void* /*arg*/) {
@@ -126,27 +113,8 @@ void stream_mic_task(void* /*arg*/) {
         chunk[i] *= gain;
       }
 
-            // Debug: show raw waveform energy instead of spectrum
-      {
-        const int width = 240;
-        uint8_t row[width];
-        int samples_per_px = mon.block_size / width;
-        if (samples_per_px < 1) samples_per_px = 1;
-        for (int x = 0; x < width; ++x) {
-          int start = x * samples_per_px;
-          int end = start + samples_per_px;
-          if (end > mon.block_size) end = mon.block_size;
-          float acc = 0.0f;
-          for (int i = start; i < end; ++i) acc += fabsf(chunk[i]);
-          float avg = acc / (end - start + 1e-6f);
-          int v = (int)(avg * 4000.0f); // scale roughly to 0-255
-          if (v > 255) v = 255;
-          row[x] = (uint8_t)v;
-        }
-        ui_push_waterfall_row(row, width);
-      }
-
       monitor_process(&mon, chunk);
+      push_waterfall_latest(mon);
       vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(160));
     }
 

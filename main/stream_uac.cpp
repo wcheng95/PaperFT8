@@ -22,6 +22,7 @@ extern "C" {
 #include <cstring>
 #include <cmath>
 #include <inttypes.h>
+#include <vector>
 
 static const char* TAG = "UAC_STREAM";
 extern void log_heap(const char* tag);
@@ -109,11 +110,12 @@ static void push_waterfall_latest(const monitor_t& mon) {
     if (mon.wf.num_blocks <= 0 || mon.wf.mag == nullptr) return;
     const int block = mon.wf.num_blocks - 1;
     const int num_bins = mon.wf.num_bins;
+    if (num_bins <= 0) return;
     const int freq_osr = mon.wf.freq_osr;
     const uint8_t* base = mon.wf.mag + block * mon.wf.block_stride;
 
-    static uint8_t collapsed[480];  // max num_bins
-    memset(collapsed, 0, num_bins);
+    static std::vector<uint8_t> collapsed;
+    collapsed.assign(num_bins, 0);
     for (int b = 0; b < num_bins; ++b) {
         uint8_t v = 0;
         for (int fs = 0; fs < freq_osr; ++fs) {
@@ -123,20 +125,7 @@ static void push_waterfall_latest(const monitor_t& mon) {
         collapsed[b] = v;
     }
 
-    constexpr int width = 240;
-    static uint8_t scaled[width];
-    for (int x = 0; x < width; ++x) {
-        int start = (int)((int64_t)x * num_bins / width);
-        int end = (int)((int64_t)(x + 1) * num_bins / width);
-        if (end <= start) end = start + 1;
-        uint8_t maxv = 0;
-        for (int s = start; s < end && s < num_bins; ++s) {
-            if (collapsed[s] > maxv) maxv = collapsed[s];
-        }
-        scaled[x] = maxv;
-    }
-
-    ui_push_waterfall_row(scaled, width);
+    ui_push_waterfall_row(collapsed.data(), num_bins);
 }
 
 // CDC-ACM helpers (CAT TX only)
