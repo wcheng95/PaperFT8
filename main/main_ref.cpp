@@ -4878,17 +4878,12 @@ static void draw_status_line(int idx, const std::string& text, bool highlight) {
   int y = start_y + idx * line_h;
   uint16_t bg = TFT_WHITE;
   M5.Display.fillRect(0, y, lay.screen_w, line_h, bg);
-  M5.Display.drawFastHLine(0, y, lay.screen_w, TFT_BLACK);
-  M5.Display.drawFastHLine(0, y + line_h - 1, lay.screen_w, TFT_BLACK);
   M5.Display.setTextColor(TFT_BLACK, bg);
   M5.Display.setTextDatum(middle_left);
   M5.Display.setTextSize(4);
   char buf[160];
-  std::snprintf(buf, sizeof(buf), "%d %s", idx + 1, text.c_str());
+  std::snprintf(buf, sizeof(buf), "%d %c%s", idx + 1, highlight ? '>' : ' ', text.c_str());
   M5.Display.drawString(buf, 24, y + (line_h / 2));
-  if (highlight) {
-    M5.Display.drawRect(0, y, lay.screen_w, line_h, TFT_BLACK);
-  }
 }
 [[maybe_unused]] static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging) {
   if (level < 0) level = 0;

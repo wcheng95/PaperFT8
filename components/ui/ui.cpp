@@ -7,6 +7,7 @@
 #include <cmath>
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "ter_u20b_lvgl.h"
 
 static constexpr int RX_LINES = 6;
 
@@ -16,10 +17,14 @@ static constexpr int kTopLineIdx = 0;
 static constexpr int kTextFirstLineIdx = 1;
 static constexpr int kCommandLineIdx = 7;
 static constexpr int kCommandButtons = 12;
-
+static constexpr int kTextLeftPx = 24;
 static constexpr int kBodyTextSize = 4;
 static constexpr int kCommandTextSize = 3;
-static constexpr int kTextLeftPx = 24;
+static constexpr int kTopScaleTextSize = 2;
+// Use LVGL font only for RX rows.
+static constexpr int kRxFontScale = 2;
+static constexpr int kRxFontSpacing = 0;
+static constexpr int kFontMaxScale = kRxFontScale;
 
 /*
  * ePaper-friendly waterfall:
@@ -58,6 +63,8 @@ static constexpr int kCmdIdxM = 6;
 static constexpr int kCmdIdxB = 7;
 static constexpr int kCmdIdxC = 8;
 static constexpr int kCmdIdxD = 9;
+static constexpr int kCmdIdxPrev = 10;
+static constexpr int kCmdIdxNext = 11;
 
 static bool ui_paused = false;
 static UiLayout g_layout;
@@ -68,6 +75,8 @@ static bool g_command_enabled[kCommandButtons] = {
 };
 static bool g_header_widgets_enabled = true;
 static bool g_countdown_enabled = true;  // runtime toggle via command button 0
+static bool g_nav_prev_available = false;
+static bool g_nav_next_available = false;
 
 static bool g_countdown_even = true;
 static int g_countdown_second = 0;  // 0..12 within 15s slot
@@ -86,6 +95,19 @@ static int rx_page = 0;
 static int rx_selected = -1;
 static std::vector<UiRxLine> last_drawn_lines;
 static int last_page = -1;
+
+struct GlyphBitmapCache {
+    bool ready = false;
+    bool valid = false;
+    int w = 0;
+    int h = 0;
+    int ofs_x = 0;
+    int ofs_y = 0;
+    int advance = 0;
+    std::vector<uint8_t> bits;
+};
+
+static GlyphBitmapCache g_glyph_cache[kFontMaxScale + 1][128];
 
 static SemaphoreHandle_t g_disp_mutex = nullptr;
 static SemaphoreHandle_t g_wf_mutex = nullptr;
@@ -148,11 +170,150 @@ static int line_y(int line_idx) {
     return g_y_offset + line_idx * kLineHeightPx;
 }
 
-static void draw_row_frame(int line_idx) {
-    const int row_y = line_y(line_idx);
-    M5.Display.fillRect(0, row_y, g_layout.screen_w, kLineHeightPx, UI_BG);
-    M5.Display.drawFastHLine(0, row_y, g_layout.screen_w, UI_FG);
-    M5.Display.drawFastHLine(0, row_y + kLineHeightPx - 1, g_layout.screen_w, UI_FG);
+static int glyph_advance_px(const lv_font_glyph_dsc_t& gd, int scale) {
+    if (scale < 1) scale = 1;
+    // LVGL adv_w is 4.4 fixed-point; apply scale before rounding.
+    return (int)(((int32_t)gd.adv_w * scale + 8) >> 4);
+}
+
+static bool fetch_glyph(uint32_t ch, uint32_t next, lv_font_glyph_dsc_t& gd, const uint8_t*& bmp) {
+    if (lv_font_get_glyph_dsc(&ter_u20b_lvgl, &gd, ch, next)) {
+        bmp = lv_font_get_glyph_bitmap(&ter_u20b_lvgl, ch);
+        if (bmp) return true;
+    }
+    if (ch != '?') {
+        if (lv_font_get_glyph_dsc(&ter_u20b_lvgl, &gd, '?', 0)) {
+            bmp = lv_font_get_glyph_bitmap(&ter_u20b_lvgl, '?');
+            if (bmp) return true;
+        }
+    }
+    return false;
+}
+
+static inline void set_bitmap_bit(uint8_t* bits, int row_bytes, int x, int y) {
+    bits[y * row_bytes + (x >> 3)] |= static_cast<uint8_t>(0x80u >> (x & 7));
+}
+
+static const GlyphBitmapCache* get_cached_glyph(uint32_t ch, int scale) {
+    if (scale < 1 || scale > kFontMaxScale) return nullptr;
+    const uint32_t code = (ch >= 32 && ch <= 126) ? ch : static_cast<uint32_t>('?');
+    auto& e = g_glyph_cache[scale][code];
+    if (e.ready) {
+        return e.valid ? &e : nullptr;
+    }
+
+    e.ready = true;
+    e.valid = false;
+    e.bits.clear();
+    e.w = 0;
+    e.h = 0;
+    e.ofs_x = 0;
+    e.ofs_y = 0;
+    e.advance = 0;
+
+    lv_font_glyph_dsc_t gd{};
+    const uint8_t* bmp = nullptr;
+    if (!fetch_glyph(code, 0, gd, bmp) || !bmp) {
+        return nullptr;
+    }
+
+    e.advance = glyph_advance_px(gd, scale);
+    e.ofs_x = gd.ofs_x * scale;
+    e.ofs_y = gd.ofs_y * scale;
+
+    if (gd.box_w <= 0 || gd.box_h <= 0) {
+        e.valid = true;
+        return &e;
+    }
+
+    if (scale == 1) {
+        const int src_row_bytes = (gd.box_w + 7) >> 3;
+        const int src_size = src_row_bytes * gd.box_h;
+        e.w = gd.box_w;
+        e.h = gd.box_h;
+        e.bits.assign(bmp, bmp + src_size);
+        e.valid = true;
+        return &e;
+    }
+
+    const int src_row_bytes = (gd.box_w + 7) >> 3;
+    const int out_w = gd.box_w * scale;
+    const int out_h = gd.box_h * scale;
+    const int out_row_bytes = (out_w + 7) >> 3;
+    e.w = out_w;
+    e.h = out_h;
+    e.bits.assign(out_row_bytes * out_h, 0);
+
+    for (int gy = 0; gy < gd.box_h; ++gy) {
+        for (int gx = 0; gx < gd.box_w; ++gx) {
+            const uint8_t byte = bmp[(gy * src_row_bytes) + (gx >> 3)];
+            const bool on = (byte & (0x80u >> (gx & 7))) != 0;
+            if (!on) continue;
+            const int ox = gx * scale;
+            const int oy = gy * scale;
+            for (int sy = 0; sy < scale; ++sy) {
+                for (int sx = 0; sx < scale; ++sx) {
+                    set_bitmap_bit(e.bits.data(), out_row_bytes, ox + sx, oy + sy);
+                }
+            }
+        }
+    }
+
+    e.valid = true;
+    return &e;
+}
+
+static int glyph_step_px(const GlyphBitmapCache& g) {
+    // Keep natural advance, but never step less than the glyph's drawn right edge.
+    const int right = g.ofs_x + g.w;
+    int step = g.advance;
+    if ((right + 1) > step) {
+        step = right + 1;
+    }
+    return (step > 0) ? step : 1;
+}
+
+static int lvgl_text_width_px(const char* text, int scale, int letter_spacing) {
+    if (!text || scale <= 0) return 0;
+    const size_t n = std::strlen(text);
+    int width = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t ch = static_cast<uint8_t>(text[i]);
+        const GlyphBitmapCache* g = get_cached_glyph(ch, scale);
+        if (!g) continue;
+        width += glyph_step_px(*g);
+        if (i + 1 < n) width += letter_spacing;
+    }
+    return width;
+}
+
+static void draw_lvgl_text(const char* text, int x, int y_center, bool center_align, int scale, int letter_spacing) {
+    if (!text || !text[0] || scale <= 0) return;
+    if (letter_spacing < 0) letter_spacing = 0;
+
+    int cursor_x = x;
+    if (center_align) {
+        cursor_x -= lvgl_text_width_px(text, scale, letter_spacing) / 2;
+    }
+    const int line_h = (int)ter_u20b_lvgl.line_height * scale;
+    const int top_y = y_center - (line_h / 2);
+
+    const size_t n = std::strlen(text);
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t ch = static_cast<uint8_t>(text[i]);
+        const GlyphBitmapCache* g = get_cached_glyph(ch, scale);
+        if (!g) continue;
+
+        const int glyph_x = cursor_x + g->ofs_x;
+        const int glyph_y = top_y + g->ofs_y;
+        if (g->w > 0 && g->h > 0 && !g->bits.empty()) {
+            // Draw foreground only; row background is cleared once before text render.
+            M5.Display.drawBitmap(glyph_x, glyph_y, g->bits.data(), g->w, g->h, UI_FG);
+        }
+
+        cursor_x += glyph_step_px(*g);
+        if (i + 1 < n) cursor_x += letter_spacing;
+    }
 }
 
 static void draw_waterfall_freq_marks_locked() {
@@ -169,7 +330,7 @@ static void draw_waterfall_freq_marks_locked() {
 
     M5.Display.setTextColor(UI_FG, UI_BG);
     M5.Display.setTextDatum(top_center);
-    M5.Display.setTextSize(2);
+    M5.Display.setTextSize(kTopScaleTextSize);
 
     auto draw_thick_tick = [&](int x, int y, int h, int thickness) {
         if (h <= 0 || thickness <= 0) return;
@@ -204,7 +365,9 @@ static void draw_waterfall_freq_marks_locked() {
 
 static void draw_mode_row(const char* text) {
     (void)text;
-    draw_row_frame(kTopLineIdx);
+    const int row_y = line_y(kTopLineIdx);
+    // Header row without frame lines.
+    M5.Display.fillRect(0, row_y, g_layout.screen_w, kLineHeightPx, UI_BG);
     draw_waterfall_freq_marks_locked();
 }
 
@@ -310,19 +473,28 @@ static void waterfall_snapshot_tick(int slot_sec, bool even_slot) {
     }
 }
 
-static void draw_text_row(int row_idx, const char* text, bool outline) {
+static void draw_text_row(int row_idx, const char* text, bool outline, bool use_rx_font) {
     if (row_idx < 0 || row_idx >= RX_LINES) return;
     const int screen_line = kTextFirstLineIdx + row_idx;
     const int row_y = line_y(screen_line);
 
-    draw_row_frame(screen_line);
-    M5.Display.setTextColor(UI_FG, UI_BG);
-    M5.Display.setTextDatum(middle_left);
-    M5.Display.setTextSize(kBodyTextSize);
-    M5.Display.drawString(text ? text : "", kTextLeftPx, row_y + (kLineHeightPx / 2));
+    // Text lines 1-6: clear background only (no inter-line borders).
+    M5.Display.fillRect(0, row_y, g_layout.screen_w, kLineHeightPx, UI_BG);
+    if (use_rx_font) {
+        draw_lvgl_text(text ? text : "", kTextLeftPx, row_y + (kLineHeightPx / 2), false, kRxFontScale, kRxFontSpacing);
+    } else {
+        M5.Display.setTextColor(UI_FG, UI_BG);
+        M5.Display.setTextDatum(middle_left);
+        M5.Display.setTextSize(kBodyTextSize);
+        M5.Display.drawString(text ? text : "", kTextLeftPx, row_y + (kLineHeightPx / 2));
+    }
 
     if (outline) {
-        M5.Display.drawRect(0, row_y, g_layout.screen_w, kLineHeightPx, UI_FG);
+        // Non-line highlight marker (keeps selection visible without row frames).
+        const int marker = 8;
+        const int mx = 8;
+        const int my = row_y + (kLineHeightPx - marker) / 2;
+        M5.Display.fillRect(mx, my, marker, marker, UI_FG);
     }
 }
 
@@ -337,7 +509,6 @@ static void draw_command_button_locked(int button_idx) {
     if (button_idx == 0 && g_countdown_enabled) {
         const bool odd = !g_countdown_even;
         const uint16_t bg = UI_BG;
-        const uint16_t fg = UI_FG;
         const bool full_redraw = !g_countdown_visual_initialized || (g_countdown_visual_odd != odd);
         if (full_redraw) {
             M5.Display.fillRect(x0, row_y, w, kLineHeightPx, bg);
@@ -363,11 +534,11 @@ static void draw_command_button_locked(int button_idx) {
                 M5.Display.fillRect(x0 + inner_pad_x, row_y + inner_pad_y, inner_w, inner_h, bg);
             }
         }
-        M5.Display.setTextColor(fg, bg);
-        M5.Display.setTextDatum(middle_center);
-        M5.Display.setTextSize(kCommandTextSize);
         char label[4];
         std::snprintf(label, sizeof(label), "%d", g_countdown_second);
+        M5.Display.setTextColor(UI_FG, UI_BG);
+        M5.Display.setTextDatum(middle_center);
+        M5.Display.setTextSize(kCommandTextSize);
         M5.Display.drawString(label, x0 + (w / 2), row_y + (kLineHeightPx / 2));
         return;
     }
@@ -378,11 +549,31 @@ static void draw_command_button_locked(int button_idx) {
 
     const bool active = (button_idx == g_active_mode_button);
     const bool enabled = g_command_enabled[button_idx];
-    const uint16_t bg = active ? UI_FG : UI_BG;
-    const uint16_t fg = active ? UI_BG : UI_FG;
+    bool nav_available = false;
+    if (button_idx == kCmdIdxPrev) {
+        nav_available = g_nav_prev_available;
+    } else if (button_idx == kCmdIdxNext) {
+        nav_available = g_nav_next_available;
+    }
+    const bool nav_highlight = (button_idx == kCmdIdxPrev || button_idx == kCmdIdxNext) && nav_available;
+    const bool highlight = active || nav_highlight;
+    const uint16_t bg = UI_BG;
+    const uint16_t fg = UI_FG;
 
     M5.Display.fillRect(x0, row_y, w, kLineHeightPx, bg);
     M5.Display.drawRect(x0, row_y, w, kLineHeightPx, UI_FG);
+    if (highlight) {
+        // 3px inner frame to indicate active/available without inversion.
+        constexpr int kInnerFrameStart = 2;
+        constexpr int kInnerFrameWidth = 3;
+        for (int t = 0; t < kInnerFrameWidth; ++t) {
+            const int inset = kInnerFrameStart + t;
+            const int rw = w - (inset * 2);
+            const int rh = kLineHeightPx - (inset * 2);
+            if (rw <= 0 || rh <= 0) break;
+            M5.Display.drawRect(x0 + inset, row_y + inset, rw, rh, UI_FG);
+        }
+    }
 
     M5.Display.setTextColor(fg, bg);
     M5.Display.setTextDatum(middle_center);
@@ -392,7 +583,7 @@ static void draw_command_button_locked(int button_idx) {
         const int slash_y = row_y + (kLineHeightPx / 2);
         const int slash_w = std::max(0, w - 8);
         if (slash_w > 0) {
-            M5.Display.drawFastHLine(x0 + 4, slash_y, slash_w, UI_FG);
+            M5.Display.drawFastHLine(x0 + 4, slash_y, slash_w, fg);
         }
     }
 }
@@ -450,7 +641,7 @@ void ui_init() {
     draw_mode_row("");
     draw_countdown_locked();
     for (int i = 0; i < RX_LINES; ++i) {
-        draw_text_row(i, "", false);
+        draw_text_row(i, "", false, false);
     }
     draw_command_bar_locked();
     request_display_flush();
@@ -541,7 +732,7 @@ static void draw_rx_line(int row_idx, const UiRxLine& l, int line_no, bool selec
     // freq is right-aligned/padded to 4 chars; SNR is always signed 3 chars.
     std::snprintf(buf, sizeof(buf), "%d %4d %+03d %s",
                   line_no, l.offset_hz, l.snr, l.text.c_str());
-    draw_text_row(row_idx, buf, selected);
+    draw_text_row(row_idx, buf, selected, true);
 }
 
 void ui_draw_rx(int flash_index) {
@@ -563,6 +754,9 @@ void ui_draw_rx(int flash_index) {
     }
 
     DispGuard guard;
+    g_nav_prev_available = (rx_page > 0);
+    g_nav_next_available = ((rx_page + 1) * RX_LINES) < (int)rx_lines.size();
+
     const int start = rx_page * RX_LINES;
     for (int i = 0; i < RX_LINES; ++i) {
         const int idx = start + i;
@@ -570,9 +764,12 @@ void ui_draw_rx(int flash_index) {
             const bool selected = (idx == flash_index);
             draw_rx_line(i, rx_lines[idx], i + 1, selected);
         } else {
-            draw_text_row(i, "", false);
+            draw_text_row(i, "", false, true);
         }
     }
+    // RX page navigation cues on ^ / v buttons.
+    draw_command_button_locked(kCmdIdxPrev);
+    draw_command_button_locked(kCmdIdxNext);
     request_display_flush();
 
     if (flash_index < 0) {
@@ -613,33 +810,41 @@ int ui_handle_rx_key(char c) {
 
 void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight_abs) {
     DispGuard guard;
+    g_nav_prev_available = (page > 0);
+    g_nav_next_available = ((page + 1) * RX_LINES) < (int)lines.size();
 
     for (int i = 0; i < RX_LINES; ++i) {
         int idx = page * RX_LINES + i;
         if (idx < (int)lines.size()) {
             char buf[160];
             std::snprintf(buf, sizeof(buf), "%d %s", i + 1, lines[idx].c_str());
-            draw_text_row(i, buf, idx == highlight_abs);
+            draw_text_row(i, buf, idx == highlight_abs, false);
         } else {
-            draw_text_row(i, "", idx == highlight_abs);
+            draw_text_row(i, "", idx == highlight_abs, false);
         }
     }
 
+    draw_command_button_locked(kCmdIdxPrev);
+    draw_command_button_locked(kCmdIdxNext);
     request_display_flush();
 }
 
 void ui_draw_debug(const std::vector<std::string>& lines, int page) {
     DispGuard guard;
+    g_nav_prev_available = (page > 0);
+    g_nav_next_available = ((page + 1) * RX_LINES) < (int)lines.size();
 
     for (int i = 0; i < RX_LINES; ++i) {
         int idx = page * RX_LINES + i;
         if (idx < (int)lines.size()) {
-            draw_text_row(i, lines[idx].c_str(), false);
+            draw_text_row(i, lines[idx].c_str(), false, false);
         } else {
-            draw_text_row(i, "", false);
+            draw_text_row(i, "", false, false);
         }
     }
 
+    draw_command_button_locked(kCmdIdxPrev);
+    draw_command_button_locked(kCmdIdxNext);
     request_display_flush();
 }
 
@@ -674,6 +879,8 @@ void ui_set_active_mode_button(char mode_key) {
 
     if (idx == g_active_mode_button) return;
     g_active_mode_button = idx;
+    g_nav_prev_available = false;
+    g_nav_next_available = false;
 
     DispGuard guard;
     draw_command_bar_locked();
@@ -727,14 +934,16 @@ void ui_draw_tx(const std::string& next,
     (void)slot_colors;
 
     DispGuard guard;
+    const int start_idx = page * 5;
+    g_nav_prev_available = (page > 0);
+    g_nav_next_available = (start_idx + 5) < (int)queue.size();
 
     {
         char buf[160];
         std::snprintf(buf, sizeof(buf), "1 %s", next.c_str());
-        draw_text_row(0, buf, false);
+        draw_text_row(0, buf, false, false);
     }
 
-    int start_idx = page * 5;
     for (int row = 1; row < RX_LINES; ++row) {
         int idx = start_idx + (row - 1);
         if (idx < (int)queue.size()) {
@@ -742,12 +951,14 @@ void ui_draw_tx(const std::string& next,
             std::snprintf(buf, sizeof(buf), "%d %s", row + 1, queue[idx].c_str());
             bool outline = (idx == selected) ||
                            (idx < (int)mark_delete.size() && mark_delete[idx]);
-            draw_text_row(row, buf, outline);
+            draw_text_row(row, buf, outline, false);
         } else {
-            draw_text_row(row, "", false);
+            draw_text_row(row, "", false, false);
         }
     }
 
+    draw_command_button_locked(kCmdIdxPrev);
+    draw_command_button_locked(kCmdIdxNext);
     request_display_flush();
 }
 
