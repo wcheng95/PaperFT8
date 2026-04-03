@@ -1766,14 +1766,22 @@ static bool rtc_init_from_hw() {
 static void rtc_sync_to_hw() {
   if (!rtc_valid) return;
 
-  time_t now = rtc_epoch_base + (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
-  struct timeval tv = { .tv_sec = now, .tv_usec = 0 };
+  int64_t elapsed_ms = esp_timer_get_time() / 1000 - rtc_ms_start;
+  time_t now = rtc_epoch_base + (elapsed_ms / 1000);
+  int64_t rem_ms = elapsed_ms % 1000;
+  if (rem_ms < 0) {
+    rem_ms += 1000;
+    --now;
+  }
+  struct timeval tv = { .tv_sec = now, .tv_usec = static_cast<suseconds_t>(rem_ms * 1000) };
   settimeofday(&tv, NULL);
 
   // Also push system time into external RTC (BM8563/PCF8563-compatible backend).
   if (M5.Rtc.isEnabled()) {
+    // External RTC is second-resolution; round instead of floor to avoid steady lag.
+    time_t rtc_sec = now + ((tv.tv_usec >= 500000) ? 1 : 0);
     struct tm t_utc;
-    gmtime_r(&now, &t_utc);
+    gmtime_r(&rtc_sec, &t_utc);
     M5.Rtc.setDateTime(&t_utc);
   }
 
@@ -3146,6 +3154,7 @@ static void tx_start(int skip_tones) {
 
   // Mark TX as active
   g_tx_active = true;
+  ui_set_tx_indicator(true);
 }
 
 // TX state machine tick - called from main loop
@@ -3165,6 +3174,7 @@ static void tx_tick() {
       cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200);
     }
     g_tx_active = false;
+    ui_set_tx_indicator(false);
     g_pending_tx_valid = false;
     g_tx_cancel_requested = false;
     g_was_txing = false;  // TX was cancelled - don't call tick at slot boundary
@@ -3190,6 +3200,7 @@ static void tx_tick() {
     // g_was_txing stays true - tick will be called at slot boundary
 
     g_tx_active = false;
+    ui_set_tx_indicator(false);
     g_pending_tx_valid = false;
     g_tx_cancel_requested = false;
     g_tx_view_dirty = true;

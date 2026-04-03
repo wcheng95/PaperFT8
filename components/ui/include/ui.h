@@ -63,6 +63,8 @@ void ui_set_active_mode_button(char mode_key);
 void ui_set_countdown_enabled(bool enabled);
 void ui_toggle_countdown_enabled();
 bool ui_is_countdown_enabled();
+// ESC button TX indicator: false=1px frame, true=5px frame.
+void ui_set_tx_indicator(bool active);
 // Enable/disable a command button by key label (e.g. 'C', 'R', 'S', ...).
 // Disabled buttons are not hit-testable.
 void ui_set_command_enabled(char command_key, bool enabled);

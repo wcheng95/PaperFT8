@@ -63,6 +63,7 @@ static constexpr int kCmdIdxM = 6;
 static constexpr int kCmdIdxB = 7;
 static constexpr int kCmdIdxC = 8;
 static constexpr int kCmdIdxD = 9;
+static constexpr int kCmdIdxEsc = 1;
 static constexpr int kCmdIdxPrev = 10;
 static constexpr int kCmdIdxNext = 11;
 
@@ -77,6 +78,7 @@ static bool g_header_widgets_enabled = true;
 static bool g_countdown_enabled = true;  // runtime toggle via command button 0
 static bool g_nav_prev_available = false;
 static bool g_nav_next_available = false;
+static bool g_tx_indicator_active = false;
 
 static bool g_countdown_even = true;
 static int g_countdown_second = 0;  // 0..12 within 15s slot
@@ -514,8 +516,8 @@ static void draw_command_button_locked(int button_idx) {
             M5.Display.fillRect(x0, row_y, w, kLineHeightPx, bg);
             M5.Display.drawRect(x0, row_y, w, kLineHeightPx, UI_FG);
             if (odd) {
-                // Odd slot: use a heavier inner frame while keeping black-on-white text/background.
-                for (int inset = 1; inset <= 3; ++inset) {
+                // Odd slot: 5px total frame (outer + 4 inner).
+                for (int inset = 1; inset <= 4; ++inset) {
                     const int rw = w - (inset * 2);
                     const int rh = kLineHeightPx - (inset * 2);
                     if (rw <= 0 || rh <= 0) break;
@@ -562,7 +564,15 @@ static void draw_command_button_locked(int button_idx) {
 
     M5.Display.fillRect(x0, row_y, w, kLineHeightPx, bg);
     M5.Display.drawRect(x0, row_y, w, kLineHeightPx, UI_FG);
-    if (highlight) {
+    if (button_idx == kCmdIdxEsc && g_tx_indicator_active) {
+        // TX active indicator on ESC: 5px total frame (outer + 4 inner).
+        for (int inset = 1; inset <= 4; ++inset) {
+            const int rw = w - (inset * 2);
+            const int rh = kLineHeightPx - (inset * 2);
+            if (rw <= 0 || rh <= 0) break;
+            M5.Display.drawRect(x0 + inset, row_y + inset, rw, rh, UI_FG);
+        }
+    } else if (highlight) {
         // 3px inner frame to indicate active/available without inversion.
         constexpr int kInnerFrameStart = 2;
         constexpr int kInnerFrameWidth = 3;
@@ -903,6 +913,14 @@ bool ui_is_countdown_enabled() {
     return g_countdown_enabled;
 }
 
+void ui_set_tx_indicator(bool active) {
+    if (g_tx_indicator_active == active) return;
+    g_tx_indicator_active = active;
+    DispGuard guard;
+    draw_command_button_locked(kCmdIdxEsc);
+    request_display_flush();
+}
+
 void ui_set_command_enabled(char command_key, bool enabled) {
     int idx = command_index_from_key(command_key);
     if (idx < 0 || idx >= kCommandButtons) return;
@@ -991,4 +1009,3 @@ void ui_rx_scroll(int delta) {
         }
     }
 }
-
