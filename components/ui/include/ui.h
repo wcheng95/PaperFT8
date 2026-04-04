@@ -56,6 +56,8 @@ void ui_draw_mode_box(const char* mode_label);
 int ui_rx_hit_test(int x, int y); // returns absolute index or -1
 int ui_text_line_hit_test(int x, int y); // returns visible line index [0..5] or -1
 void ui_rx_scroll(int delta);     // delta = -1 prev, +1 next
+// Row-local feedback helpers for e-paper tap response.
+void ui_flash_rx_line(int absolute_idx, bool highlight);
 void ui_draw_command_bar();
 // Highlight one mode command button (S/R/T/Q/M/B/C/D) as active using inverted colors.
 // Pass 0 or unsupported key to clear highlight.
@@ -73,6 +75,6 @@ int ui_command_hit_test(int x, int y); // returns command button index or -1
 void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete, const std::vector<int>& slot_colors = {});
 // Returns selected absolute index or -1 if none
 int ui_handle_rx_key(char c);
-// Generic list draw (6 lines per page)
-void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight_abs = -1);
+// Generic list draw (6 lines per page). Optional Rx font rendering is intended for startup page only.
+void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight_abs = -1, bool use_rx_font = false);
 void ui_draw_debug(const std::vector<std::string>& lines, int page);

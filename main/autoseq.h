@@ -5,9 +5,9 @@
 #include <functional>
 #include "ui.h"
 
-// Maximum concurrent QSOs in queue
-constexpr int AUTOSEQ_MAX_QUEUE = 9;
-// Maximum retries before giving up on a QSO
+// Queue size: active + inactive entries. 120 supports a full 1-hour activation.
+constexpr int AUTOSEQ_MAX_QUEUE = 120;
+// Maximum retries before moving to inactive zone
 constexpr int AUTOSEQ_MAX_RETRY = 5;
 
 // High-level auto-sequencer states

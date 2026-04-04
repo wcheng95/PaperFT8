@@ -21,7 +21,7 @@ static constexpr int kTextLeftPx = 24;
 static constexpr int kBodyTextSize = 4;
 static constexpr int kCommandTextSize = 3;
 static constexpr int kTopScaleTextSize = 2;
-// Use LVGL font only for RX rows.
+// Use LVGL font for RX/Tx text rows.
 static constexpr int kRxFontScale = 2;
 static constexpr int kRxFontSpacing = 0;
 static constexpr int kFontMaxScale = kRxFontScale;
@@ -170,6 +170,15 @@ static void ui_display_task(void*) {
 
 static int line_y(int line_idx) {
     return g_y_offset + line_idx * kLineHeightPx;
+}
+
+static int text_row_y(int row_idx) {
+    return line_y(kTextFirstLineIdx + row_idx);
+}
+
+static void refresh_text_row_locked(int row_idx) {
+    if (row_idx < 0 || row_idx >= RX_LINES) return;
+    M5.Display.display(0, text_row_y(row_idx), g_layout.screen_w, kLineHeightPx);
 }
 
 static int glyph_advance_px(const lv_font_glyph_dsc_t& gd, int scale) {
@@ -745,6 +754,14 @@ static void draw_rx_line(int row_idx, const UiRxLine& l, int line_no, bool selec
     draw_text_row(row_idx, buf, selected, true);
 }
 
+static bool draw_rx_abs_line_locked(int absolute_idx, bool highlight) {
+    if (absolute_idx < 0 || absolute_idx >= (int)rx_lines.size()) return false;
+    const int row_idx = absolute_idx - (rx_page * RX_LINES);
+    if (row_idx < 0 || row_idx >= RX_LINES) return false;
+    draw_rx_line(row_idx, rx_lines[absolute_idx], row_idx + 1, highlight);
+    return true;
+}
+
 void ui_draw_rx(int flash_index) {
     if (!rx_lines.empty() && flash_index < 0) {
         if (rx_page == last_page && last_drawn_lines.size() == rx_lines.size()) {
@@ -791,6 +808,13 @@ void ui_draw_rx(int flash_index) {
     }
 }
 
+void ui_flash_rx_line(int absolute_idx, bool highlight) {
+    DispGuard guard;
+    if (!draw_rx_abs_line_locked(absolute_idx, highlight)) return;
+    const int row_idx = absolute_idx - (rx_page * RX_LINES);
+    refresh_text_row_locked(row_idx);
+}
+
 int ui_handle_rx_key(char c) {
     int selected_idx = -1;
     if (c == 0) return selected_idx;
@@ -810,7 +834,6 @@ int ui_handle_rx_key(char c) {
         int idx = rx_page * RX_LINES + line;
         if (idx >= 0 && idx < (int)rx_lines.size()) {
             rx_selected = idx;
-            ui_draw_rx();
             selected_idx = idx;
         }
     }
@@ -818,7 +841,7 @@ int ui_handle_rx_key(char c) {
     return selected_idx;
 }
 
-void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight_abs) {
+void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight_abs, bool use_rx_font) {
     DispGuard guard;
     g_nav_prev_available = (page > 0);
     g_nav_next_available = ((page + 1) * RX_LINES) < (int)lines.size();
@@ -828,9 +851,9 @@ void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight
         if (idx < (int)lines.size()) {
             char buf[160];
             std::snprintf(buf, sizeof(buf), "%d %s", i + 1, lines[idx].c_str());
-            draw_text_row(i, buf, idx == highlight_abs, false);
+            draw_text_row(i, buf, idx == highlight_abs, use_rx_font);
         } else {
-            draw_text_row(i, "", idx == highlight_abs, false);
+            draw_text_row(i, "", idx == highlight_abs, use_rx_font);
         }
     }
 
@@ -959,7 +982,7 @@ void ui_draw_tx(const std::string& next,
     {
         char buf[160];
         std::snprintf(buf, sizeof(buf), "1 %s", next.c_str());
-        draw_text_row(0, buf, false, false);
+        draw_text_row(0, buf, false, true);
     }
 
     for (int row = 1; row < RX_LINES; ++row) {
@@ -969,9 +992,9 @@ void ui_draw_tx(const std::string& next,
             std::snprintf(buf, sizeof(buf), "%d %s", row + 1, queue[idx].c_str());
             bool outline = (idx == selected) ||
                            (idx < (int)mark_delete.size() && mark_delete[idx]);
-            draw_text_row(row, buf, outline, false);
+            draw_text_row(row, buf, outline, true);
         } else {
-            draw_text_row(row, "", false, false);
+            draw_text_row(row, "", false, true);
         }
     }
 
