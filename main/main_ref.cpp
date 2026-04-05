@@ -887,7 +887,7 @@ static bool rtc_valid = false;
 
 // RTC deep sleep compensation
 // rtc_sleep_epoch: epoch time when entering deep sleep (for calculating elapsed time)
-// rtc_comp: compensation factor in seconds per 10000 seconds (e.g., +150 = 1.5% fast)
+// rtc_comp is not user-configurable in PaperFT8 (battery-backed RTC).
 static time_t g_rtc_sleep_epoch = 0;
 static int g_rtc_comp = 0;
 
@@ -897,6 +897,7 @@ enum class RadioType { NONE, TRUSDX, QMX };
 static CqType g_cq_type = CqType::CQ;
 static std::string g_cq_freetext = "FreeText";
 static bool g_skip_tx1 = false;
+static int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
 static std::string g_free_text = "TNX 73";
 static std::string g_call = "YOURCALL";
 static std::string g_grid = "CM97";
@@ -2880,7 +2881,10 @@ static void touch_keyboard_commit_current() {
       } else if (menu_edit_idx == 10) {
         g_comment1 = menu_edit_buf;
       } else if (menu_edit_idx == 15) {
-        g_rtc_comp = atoi(menu_edit_buf.c_str());
+        int v = atoi(menu_edit_buf.c_str());
+        if (v < 0) v = 0;
+        g_autoseq_max_retry = v;
+        autoseq_set_max_retry(g_autoseq_max_retry);
       }
       save_station_data();
       menu_edit_idx = -1;
@@ -3073,7 +3077,7 @@ static const char* menu_edit_label(int idx) {
     case 7:  return "Cursor";
     case 9:  return "IgnoreList";
     case 10: return "Comment";
-    case 15: return "RTC Comp";
+    case 15: return "Max Retry";
     default: return "Edit";
   }
 }
@@ -3370,11 +3374,10 @@ static void draw_menu_view() {
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
   lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, kActiveBandMaxChars));
-  // RTC compensation: seconds per 10000 seconds (e.g., +150 = 1.5% fast)
   if (menu_edit_idx == 15) {
-    lines.push_back(std::string("RTC Comp:") + menu_edit_buf);
+    lines.push_back(std::string("Max Retry:") + menu_edit_buf);
   } else {
-    lines.push_back(std::string("RTC Comp:") + std::to_string(g_rtc_comp));
+    lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
   }
   lines.push_back("Copy Logs to SD");
   lines.push_back(menu_delete_confirm ? "Delete Logs? ^:Y v:N" : "Delete Logs");
@@ -3925,8 +3928,14 @@ static void load_station_data() {
   // If mount/copy fails, fall back to the on-device SPIFFS Station.ini.
   sync_station_ini_from_sd_to_spiffs();
 
+  g_rtc_comp = 0;
+  g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
+
   FILE* f = fopen(STATION_FILE, "r");
-  if (!f) return;
+  if (!f) {
+    autoseq_set_max_retry(g_autoseq_max_retry);
+    return;
+  }
   char line[128];
   while (fgets(line, sizeof(line), f)) {
     int idx = -1;
@@ -3971,8 +3980,10 @@ static void load_station_data() {
       g_active_band_text = std::to_string(val);
     } else if (strncmp(line, "active_bands=", 13) == 0) {
       g_active_band_text = trim_copy(line + 13);
-    } else if (sscanf(line, "rtc_comp=%d", &g_rtc_comp) == 1) {
-      // Loaded rtc_comp
+    } else if (sscanf(line, "autoseq_max_retry=%d", &val) == 1) {
+      if (val >= 0) g_autoseq_max_retry = val;
+    } else if (sscanf(line, "rtc_comp=%d", &val) == 1) {
+      // Legacy key kept for file compatibility; ignored in PaperFT8.
     } else {
       long long epoch_tmp = 0;
       if (sscanf(line, "rtc_sleep_epoch=%lld", &epoch_tmp) == 1) {
@@ -3981,6 +3992,7 @@ static void load_station_data() {
     }
   }
   fclose(f);
+  autoseq_set_max_retry(g_autoseq_max_retry);
   // Try hardware RTC first (persists through deep sleep), fall back to saved strings
   if (!rtc_init_from_hw()) {
     ESP_LOGI(TAG, "Hardware RTC not valid, using saved time strings");
@@ -4018,7 +4030,7 @@ static void save_station_data() {
   fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
   fprintf(f, "active_bands=%s\n", g_active_band_text.c_str());
   fprintf(f, "rtc_sleep_epoch=%lld\n", (long long)g_rtc_sleep_epoch);
-  fprintf(f, "rtc_comp=%d\n", g_rtc_comp);
+  fprintf(f, "autoseq_max_retry=%d\n", g_autoseq_max_retry);
   fclose(f);
 }
 
@@ -4815,7 +4827,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
-                else if (menu_edit_idx == 15) { g_rtc_comp = atoi(menu_edit_buf.c_str()); }
+                else if (menu_edit_idx == 15) {
+                  int v = atoi(menu_edit_buf.c_str());
+                  if (v < 0) v = 0;
+                  g_autoseq_max_retry = v;
+                  autoseq_set_max_retry(g_autoseq_max_retry);
+                }
                 save_station_data();
                 menu_edit_idx = -1;
                 menu_edit_buf.clear();
@@ -4829,8 +4846,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 draw_menu_view();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
-                if ((menu_edit_idx == 7 || menu_edit_idx == 15)
-                    && !((ch >= '0' && ch <= '9') || ch == '-')) {
+                if (menu_edit_idx == 15 && !(ch >= '0' && ch <= '9')) {
+                  break;
+                }
+                if (menu_edit_idx == 7 && !((ch >= '0' && ch <= '9') || ch == '-')) {
                   break;
                 }
                 if (menu_edit_idx % 6 == 3 || menu_edit_idx % 6 == 4 || menu_edit_idx % 6 == 5) {
@@ -4968,8 +4987,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 menu_long_backup = g_active_band_text;
                 draw_menu_view();
               } else if (c == '4') {
-                menu_edit_idx = 15; // RTC Comp line
-                menu_edit_buf = std::to_string(g_rtc_comp);
+                menu_edit_idx = 15; // Max Retry line
+                menu_edit_buf = std::to_string(g_autoseq_max_retry);
                 draw_menu_view();
               } else if (c == '5') {
                 esp_err_t err = copy_logs_spiffs_to_sd_overwrite();

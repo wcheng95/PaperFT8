@@ -136,6 +136,7 @@ void autoseq_set_cabrillo_fd_callback(CabrilloFdLogCallback cb);
 // Configuration setters (called when station data changes)
 void autoseq_set_station(const std::string& call, const std::string& grid);
 void autoseq_set_skip_tx1(bool skip);  // Skip TX1 and start with TX2
+void autoseq_set_max_retry(int retry); // Runtime retry limit for new/retried TX states
 
 // CQ type configuration
 enum class AutoseqCqType { CQ = 0, SOTA, POTA, QRP, FD, FREETEXT };

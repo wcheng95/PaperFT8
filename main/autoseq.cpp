@@ -31,6 +31,7 @@ static int s_inactive_start = AUTOSEQ_MAX_QUEUE;  // no inactive entries
 static std::string s_my_call;
 static std::string s_my_grid;
 static bool s_skip_tx1 = false;
+static int s_max_retry = AUTOSEQ_MAX_RETRY;
 
 // Forward declarations (must appear before format_tx_text uses them)
 static std::string trim_copy(const std::string& s);
@@ -88,6 +89,11 @@ static bool has_exchanged(const QsoContext* ctx) {
 
 static inline int64_t mono_ms() {
     return esp_timer_get_time() / 1000;
+}
+
+static inline int clamp_retry_limit(int retry) {
+    if (retry < 0) return 0;
+    return retry;
 }
 
 // ============== Public API ==============
@@ -231,7 +237,7 @@ void autoseq_on_touch(const UiRxLine& msg) {
     //  ctx->snr_tx, (int)s_skip_tx1);
 
     set_state(ctx, s_skip_tx1 ? AutoseqState::REPORT : AutoseqState::REPLYING,
-              s_skip_tx1 ? TxMsgType::TX2 : TxMsgType::TX1, AUTOSEQ_MAX_RETRY);
+              s_skip_tx1 ? TxMsgType::TX2 : TxMsgType::TX1, s_max_retry);
     sort_and_clean();
 
     //dlogf("TH: af snr_tx=%d state=%d",
@@ -427,6 +433,19 @@ void autoseq_set_station(const std::string& call, const std::string& grid) {
 
 void autoseq_set_skip_tx1(bool skip) {
     s_skip_tx1 = skip;
+}
+
+void autoseq_set_max_retry(int retry) {
+    s_max_retry = clamp_retry_limit(retry);
+    for (int i = 0; i < s_active_count; ++i) {
+        QsoContext& ctx = s_queue[i];
+        if (ctx.retry_limit > 0) {
+            ctx.retry_limit = s_max_retry;
+            if (ctx.retry_counter > ctx.retry_limit) {
+                ctx.retry_counter = ctx.retry_limit;
+            }
+        }
+    }
 }
 
 void autoseq_set_cq_type(AutoseqCqType type, const std::string& freetext) {
@@ -718,13 +737,13 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         case AutoseqState::CALLING:  // We sent CQ
             switch (rcvd) {
                 case TxMsgType::TX1:
-                    set_state(ctx, AutoseqState::REPORT, TxMsgType::TX2, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::REPORT, TxMsgType::TX2, s_max_retry);
                     return true;
                 case TxMsgType::TX2:
-                    set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX3, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX3, s_max_retry);
                     return true;
                 case TxMsgType::TX3:
-                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, s_max_retry);
                     log_qso_if_needed(ctx);
                     return true;
                 default:
@@ -734,10 +753,10 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         case AutoseqState::REPLYING:  // We sent TX1
             switch (rcvd) {
                 case TxMsgType::TX2:
-                    set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX3, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX3, s_max_retry);
                     return true;
                 case TxMsgType::TX3:
-                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, s_max_retry);
                     log_qso_if_needed(ctx);
                     return true;
                 case TxMsgType::TX4:
@@ -756,10 +775,10 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     // DX sent their own report (no R prefix) — they either
                     // didn't copy our TX2 or changed from TX1 to TX2.
                     // Both sides have exchanged reports; advance to TX3.
-                    set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX3, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX3, s_max_retry);
                     return true;
                 case TxMsgType::TX3:
-                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, s_max_retry);
                     log_qso_if_needed(ctx);
                     return true;
                 case TxMsgType::TX4:
@@ -776,7 +795,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
             switch (rcvd) {
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
-                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, s_max_retry);
                     ctx->park_after_signoff_tx = true;
                     log_qso_if_needed(ctx);
                     return true;
@@ -789,7 +808,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                 case TxMsgType::TX3:
                     // DX didn't get our RR73 — re-send with fresh retries.
                     // Already logged at ROGERS entry; logged flag prevents duplicate.
-                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, AUTOSEQ_MAX_RETRY);
+                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, s_max_retry);
                     return true;
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
