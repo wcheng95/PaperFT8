@@ -1,12 +1,13 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <functional>
 #include "ui.h"
 
-// Queue size: active + inactive entries. 120 supports a full 1-hour activation.
-constexpr int AUTOSEQ_MAX_QUEUE = 120;
+// Queue size: active + inactive entries.
+constexpr int AUTOSEQ_MAX_QUEUE = 30;
 // Maximum retries before moving to inactive zone
 constexpr int AUTOSEQ_MAX_RETRY = 5;
 
@@ -49,6 +50,13 @@ struct QsoContext {
     int retry_limit = AUTOSEQ_MAX_RETRY;
     bool logged = false;    // Prevents duplicate ADIF logging
     bool is_fd = false;
+    // SIGNOFF handling:
+    // true  -> after sending TX5, park context in inactive for possible late RR73
+    // false -> after sending TX5, finish immediately (IDLE/pop)
+    bool park_after_signoff_tx = false;
+    // Timestamp when the context was moved to inactive zone (ms, monotonic).
+    // 0 means currently active / not yet parked.
+    int64_t inactive_since_ms = 0;
 
     int offset_hz = 1500;   // TX audio offset
     int slot_id = 0;        // TX slot (0=even, 1=odd)

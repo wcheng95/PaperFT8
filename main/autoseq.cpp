@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string>
 #include <unordered_map>
 
@@ -83,6 +84,10 @@ static bool has_exchanged(const QsoContext* ctx) {
     if (!ctx) return false;
     if (ctx->dxcall.empty() || ctx->dxcall == "CQ") return false;
     return ctx->state > AutoseqState::REPLYING;
+}
+
+static inline int64_t mono_ms() {
+    return esp_timer_get_time() / 1000;
 }
 
 // ============== Public API ==============
@@ -295,9 +300,15 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
             ctx->next_tx = TxMsgType::TX_UNDEF;
             break;
         case AutoseqState::SIGNOFF:
-            // QSO complete and logged — safe to evict
-            ctx->state = AutoseqState::IDLE;
-            ctx->next_tx = TxMsgType::TX_UNDEF;
+            // After TX5:
+            // - First pass: park in inactive so late RR73 can be answered.
+            // - Late-ack pass: finish immediately.
+            if (ctx->park_after_signoff_tx) {
+                move_to_inactive(0);
+            } else {
+                ctx->state = AutoseqState::IDLE;
+                ctx->next_tx = TxMsgType::TX_UNDEF;
+            }
             break;
         default:
             break;
@@ -732,6 +743,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, 0);
+                    ctx->park_after_signoff_tx = true;
                     log_qso_if_needed(ctx);
                     return true;
                 default:
@@ -753,6 +765,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, 0);
+                    ctx->park_after_signoff_tx = true;
                     log_qso_if_needed(ctx);
                     return true;
                 default:
@@ -764,6 +777,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, AUTOSEQ_MAX_RETRY);
+                    ctx->park_after_signoff_tx = true;
                     log_qso_if_needed(ctx);
                     return true;
                 default:
@@ -790,10 +804,15 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         case AutoseqState::SIGNOFF:  // We sent TX5
             switch (rcvd) {
                 case TxMsgType::TX4:
-                case TxMsgType::TX5:
-                    // Already logged at SIGNOFF entry; send another 73
-                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, AUTOSEQ_MAX_RETRY);
+                    // Late RR73: send another 73 and park inactive again.
+                    set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, 0);
+                    ctx->park_after_signoff_tx = true;
                     return true;
+                case TxMsgType::TX5:
+                    // Late 73: finish with no further TX.
+                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_UNDEF, 0);
+                    ctx->park_after_signoff_tx = false;
+                    return false;
                 default:
                     return false;
             }
@@ -940,6 +959,7 @@ static void move_to_inactive(int idx) {
     // Copy to inactive zone (grows leftward)
     QsoContext saved = s_queue[idx];
     saved.next_tx = TxMsgType::TX_UNDEF;
+    saved.inactive_since_ms = mono_ms();
 
     // Remove from active zone by shifting
     for (int i = idx; i + 1 < s_active_count; ++i) {
@@ -952,15 +972,24 @@ static void move_to_inactive(int idx) {
 }
 
 // Evict an inactive entry to free one slot.
-// Evicts the entry at s_inactive_start (left edge of inactive zone) — O(1).
+// Evicts the oldest inactive entry by inactive_since_ms.
 static void evict_oldest_inactive() {
     if (s_inactive_start >= AUTOSEQ_MAX_QUEUE) return;  // No inactive entries
 
-    // To evict the oldest (rightmost, at AUTOSEQ_MAX_QUEUE-1) without shifting,
-    // overwrite it with the newest (leftmost, at s_inactive_start), then shrink
-    // the zone from the left.
-    if (s_inactive_start < AUTOSEQ_MAX_QUEUE - 1) {
-        s_queue[AUTOSEQ_MAX_QUEUE - 1] = s_queue[s_inactive_start];
+    int oldest_idx = s_inactive_start;
+    int64_t oldest_ts = s_queue[oldest_idx].inactive_since_ms;
+    for (int i = s_inactive_start + 1; i < AUTOSEQ_MAX_QUEUE; ++i) {
+        int64_t ts = s_queue[i].inactive_since_ms;
+        // For equal timestamps, prefer rightmost entry as older.
+        if (ts < oldest_ts || (ts == oldest_ts && i > oldest_idx)) {
+            oldest_ts = ts;
+            oldest_idx = i;
+        }
+    }
+
+    // Remove oldest_idx from inactive zone and keep the zone contiguous.
+    for (int i = oldest_idx; i > s_inactive_start; --i) {
+        s_queue[i] = s_queue[i - 1];
     }
     ++s_inactive_start;
 }
@@ -992,6 +1021,7 @@ static void reactivate(int inactive_idx) {
     s_queue[s_active_count++] = saved;
     // Reset retry counter for fresh attempts
     s_queue[s_active_count - 1].retry_counter = 0;
+    s_queue[s_active_count - 1].inactive_since_ms = 0;
     ESP_LOGI(TAG, "Reactivated %s into active zone (active=%d)",
              saved.dxcall.c_str(), s_active_count);
 }
