@@ -1661,7 +1661,7 @@ static const char* cq_type_name(CqType t) {
 static const char* offset_name(OffsetSrc o) {
   switch (o) {
     case OffsetSrc::RANDOM: return "Random";
-    case OffsetSrc::CURSOR: return "Cursor";
+    case OffsetSrc::CURSOR: return "Fixed";
     case OffsetSrc::RX: return "RX";
   }
   return "Random";
@@ -3357,9 +3357,9 @@ static void draw_menu_view() {
 
   lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
   if (menu_edit_idx == 7) {
-    lines.push_back(std::string("Cursor:") + menu_edit_buf);
+    lines.push_back(std::string("Fixed:") + menu_edit_buf);
   } else {
-    lines.push_back(std::string("Cursor:") + std::to_string(g_offset_hz));
+    lines.push_back(std::string("Fixed:") + std::to_string(g_offset_hz));
   }
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
   lines.push_back(std::string("IgnoreList:") + head_trim(g_ignore_prefix_text, kIgnoreListMaxChars));
