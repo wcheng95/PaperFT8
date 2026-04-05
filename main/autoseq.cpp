@@ -113,10 +113,16 @@ static void dlogf(const char* fmt, ...) {
 
 bool autoseq_drop_index(int idx) {
     if (idx < 0 || idx >= s_active_count) return false;
-    for (int i = idx; i + 1 < s_active_count; ++i) {
-        s_queue[i] = s_queue[i + 1];
+    // TX-page "drop" should preserve QSO metadata for late retries.
+    // Keep CQ/transient entries removable as before.
+    if (s_queue[idx].state == AutoseqState::CALLING || s_queue[idx].dxcall == "CQ") {
+        for (int i = idx; i + 1 < s_active_count; ++i) {
+            s_queue[i] = s_queue[i + 1];
+        }
+        --s_active_count;
+        return true;
     }
-    --s_active_count;
+    move_to_inactive(idx);
     return true;
 }
 

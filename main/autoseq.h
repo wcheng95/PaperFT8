@@ -77,7 +77,8 @@ void autoseq_init();
 // Clear all active QSOs
 void autoseq_clear();
 
-// Drop a QSO by index (0-based in display order). Returns true if removed.
+// Drop a QSO by index (0-based in display order).
+// For active QSOs, this moves the context to inactive; CQ entries are removed.
 bool autoseq_drop_index(int idx);
 
 // Rotate to the next QSO with the same slot parity as the current head.
