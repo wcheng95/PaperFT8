@@ -50,6 +50,7 @@ struct QsoContext {
     int retry_limit = AUTOSEQ_MAX_RETRY;
     bool logged = false;    // Prevents duplicate ADIF logging
     bool is_fd = false;
+    std::string fd_rx_exchange; // Last received FD exchange (for Cabrillo logging)
     // SIGNOFF handling:
     // true  -> after sending TX5, park context in inactive for possible late RR73
     // false -> after sending TX5, finish immediately (IDLE/pop)

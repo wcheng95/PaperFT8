@@ -827,7 +827,7 @@ static std::vector<std::string> g_ctrl_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "PaperFT8 V1.4.1",
+    "PaperFT8 V1.4.2",
     "S: Status(Operate)",
     "R: Rx page",
     "T: Tx page",
@@ -2438,9 +2438,28 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
     float cand_db = noise_db;
     {
+      // Canonical waterfall indexing:
+      // [time_block][time_sub][freq_sub][freq_bin]
+      // Clamp time to valid range (1A) to avoid fallback-to-noise zero SNR on edge candidates.
       int t_index = candidates[i].time_offset * mon->wf.time_osr + candidates[i].time_sub;
-      int f_index = candidates[i].freq_offset * mon->wf.freq_osr + candidates[i].freq_sub;
-      size_t offset2 = (size_t)t_index * (size_t)mon->wf.block_stride + (size_t)f_index;
+      const int t_count = mon->wf.num_blocks * mon->wf.time_osr;
+      if (t_count > 0) {
+        if (t_index < 0) t_index = 0;
+        if (t_index >= t_count) t_index = t_count - 1;
+      } else {
+        t_index = 0;
+      }
+
+      int f_index = candidates[i].freq_sub * mon->wf.num_bins + candidates[i].freq_offset;
+      const int f_count = mon->wf.freq_osr * mon->wf.num_bins;
+      if (f_count > 0) {
+        if (f_index < 0) f_index = 0;
+        if (f_index >= f_count) f_index = f_count - 1;
+      } else {
+        f_index = 0;
+      }
+
+      size_t offset2 = (size_t)t_index * (size_t)f_count + (size_t)f_index;
       size_t total2 = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
       if (mon->wf.mag && offset2 < total2) {
         int scaled = mon->wf.mag[offset2];

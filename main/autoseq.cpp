@@ -13,7 +13,6 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <string>
-#include <unordered_map>
 
 //void debug_log_line_public(const std::string& msg);
 static const char* TAG = "AUTOSEQ";
@@ -47,8 +46,6 @@ static AdifLogCallback s_adif_callback;
 // Cabrillo Field Day callback (for ARRL-FD logging)
 static CabrilloFdLogCallback s_cabrillo_fd_callback = nullptr;
 
-// Track latest received FD exchange per dxcall
-static std::unordered_map<std::string, std::string> s_fd_rx_exchange;
 
 // TX scheduling state
 static bool s_pending_valid = false;
@@ -609,7 +606,7 @@ static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
         // FD exchange shortcut
         std::string norm;
         if (ctx && parse_fd_exchange(msg.field3, norm) && !ctx->dxcall.empty()) {
-            s_fd_rx_exchange[ctx->dxcall] = norm;
+            ctx->fd_rx_exchange = norm;
 
             std::string t = trim_copy(msg.field3);
             if (!t.empty() && (t[0] == 'R' || t[0] == 'r')) rcvd = TxMsgType::TX3;
@@ -646,11 +643,9 @@ static void log_qso_if_needed(QsoContext* ctx) {
     if (!ctx || ctx->logged) return;
 
     // Cabrillo Field Day log (optional, independent of ADIF)
-    if (ctx->is_fd && s_cabrillo_fd_callback && !ctx->dxcall.empty()) {
-        auto it = s_fd_rx_exchange.find(ctx->dxcall);
-        if (it != s_fd_rx_exchange.end()) {
-            s_cabrillo_fd_callback(ctx->dxcall, it->second);
-        }
+    if (ctx->is_fd && s_cabrillo_fd_callback &&
+        !ctx->dxcall.empty() && !ctx->fd_rx_exchange.empty()) {
+        s_cabrillo_fd_callback(ctx->dxcall, ctx->fd_rx_exchange);
     }
 
     if (!s_adif_callback) return;
