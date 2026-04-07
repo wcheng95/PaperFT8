@@ -21,6 +21,7 @@ static constexpr int kTextLeftPx = 24;
 static constexpr int kBodyTextSize = 4;
 static constexpr int kCommandTextSize = 3;
 static constexpr int kTopScaleTextSize = 2;
+static constexpr int kTextBottomCushionPx = 3;
 // Use LVGL font for RX/Tx text rows.
 static constexpr int kRxFontScale = 2;
 static constexpr int kRxFontSpacing = 0;
@@ -97,6 +98,7 @@ static int rx_page = 0;
 static int rx_selected = -1;
 static std::vector<UiRxLine> last_drawn_lines;
 static int last_page = -1;
+static std::string g_visible_rows[RX_LINES];
 
 struct GlyphBitmapCache {
     bool ready = false;
@@ -488,16 +490,18 @@ static void draw_text_row(int row_idx, const char* text, bool outline, bool use_
     if (row_idx < 0 || row_idx >= RX_LINES) return;
     const int screen_line = kTextFirstLineIdx + row_idx;
     const int row_y = line_y(screen_line);
+    const int text_y = row_y + (kLineHeightPx / 2) - kTextBottomCushionPx;
+    g_visible_rows[row_idx] = text ? text : "";
 
     // Text lines 1-6: clear background only (no inter-line borders).
     M5.Display.fillRect(0, row_y, g_layout.screen_w, kLineHeightPx, UI_BG);
     if (use_rx_font) {
-        draw_lvgl_text(text ? text : "", kTextLeftPx, row_y + (kLineHeightPx / 2), false, kRxFontScale, kRxFontSpacing);
+        draw_lvgl_text(text ? text : "", kTextLeftPx, text_y, false, kRxFontScale, kRxFontSpacing);
     } else {
         M5.Display.setTextColor(UI_FG, UI_BG);
         M5.Display.setTextDatum(middle_left);
         M5.Display.setTextSize(kBodyTextSize);
-        M5.Display.drawString(text ? text : "", kTextLeftPx, row_y + (kLineHeightPx / 2));
+        M5.Display.drawString(text ? text : "", kTextLeftPx, text_y);
     }
 
     if (outline) {
@@ -879,6 +883,27 @@ void ui_draw_debug(const std::vector<std::string>& lines, int page) {
     draw_command_button_locked(kCmdIdxPrev);
     draw_command_button_locked(kCmdIdxNext);
     request_display_flush();
+}
+
+void ui_get_visible_text_lines(std::vector<std::string>& out) {
+    out.clear();
+    out.reserve(RX_LINES);
+    for (int i = 0; i < RX_LINES; ++i) {
+        out.push_back(g_visible_rows[i]);
+    }
+}
+
+void ui_set_visible_text_line(int row_idx, const std::string& text) {
+    if (row_idx < 0 || row_idx >= RX_LINES) return;
+    g_visible_rows[row_idx] = text;
+}
+
+void ui_get_rx_page_info(int& current_page, int& total_pages) {
+    total_pages = (int)rx_lines.size() <= 0 ? 1 : (((int)rx_lines.size() + RX_LINES - 1) / RX_LINES);
+    if (total_pages < 1) total_pages = 1;
+    current_page = rx_page + 1;
+    if (current_page < 1) current_page = 1;
+    if (current_page > total_pages) current_page = total_pages;
 }
 
 void ui_draw_mode_box(const char* mode_label) {

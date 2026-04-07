@@ -11,6 +11,9 @@ idf_component_register(
         touch_keyboard
         ui
         ft8_lib
+        bt
+        nvs_flash
+        efuse
         spiffs
         fatfs
         sdmmc

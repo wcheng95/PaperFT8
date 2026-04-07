@@ -499,7 +499,7 @@ static void stream_uac_task(void* arg) {
         .f_min = 200.0f,
         .f_max = 3000.0f,
         .sample_rate = FT8_SAMPLE_RATE,
-        .time_osr = 1,
+        .time_osr = 2,
         .freq_osr = 2,
         .protocol = FTX_PROTOCOL_FT8
     };

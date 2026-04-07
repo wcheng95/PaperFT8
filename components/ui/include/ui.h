@@ -78,3 +78,9 @@ int ui_handle_rx_key(char c);
 // Generic list draw (6 lines per page). Optional Rx font rendering is intended for startup page only.
 void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight_abs = -1, bool use_rx_font = false);
 void ui_draw_debug(const std::vector<std::string>& lines, int page);
+// Returns the currently rendered text rows (exact strings drawn for lines 1..6).
+void ui_get_visible_text_lines(std::vector<std::string>& out);
+// Override one mirrored row for custom render paths outside ui.cpp (e.g. STATUS).
+void ui_set_visible_text_line(int row_idx, const std::string& text);
+// RX paging info (1-based current page, total pages >= 1).
+void ui_get_rx_page_info(int& current_page, int& total_pages);

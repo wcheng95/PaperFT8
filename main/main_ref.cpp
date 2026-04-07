@@ -59,7 +59,7 @@ static const char* STATION_FILE = "/spiffs/Station.ini";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
 
-#define ENABLE_BLE 0
+#define ENABLE_BLE 1
 
 #if ENABLE_BLE
 #include "nimble/nimble_port.h"
@@ -71,91 +71,144 @@ static bool g_sd_mounted = false;
 #include "nvs_flash.h"
 #include "soc/soc_caps.h"
 #include "esp_bt.h"
+#include "esp_mac.h"
 
 #endif
 #ifndef FT8_SAMPLE_RATE
 #define FT8_SAMPLE_RATE 12000
 #endif
 
-#define UART_SVC_UUID   0xFFE0
-#define UART_RX_UUID    0xFFE1
-#define UART_TX_UUID    0xFFE2
+#define BLE_UI_SVC_UUID   0xFFE0
+#define BLE_UI_RX_UUID    0xFFE1
+#define BLE_UI_TX_UUID    0xFFE2
 
 #if ENABLE_BLE
-static const ble_uuid16_t uart_svc_uuid =
-    BLE_UUID16_INIT(UART_SVC_UUID);
-static const ble_uuid16_t uart_rx_uuid =
-    BLE_UUID16_INIT(UART_RX_UUID);
-static const ble_uuid16_t uart_tx_uuid =
-    BLE_UUID16_INIT(UART_TX_UUID);
+static const ble_uuid16_t ble_ui_svc_uuid = BLE_UUID16_INIT(BLE_UI_SVC_UUID);
+static const ble_uuid16_t ble_ui_rx_uuid = BLE_UUID16_INIT(BLE_UI_RX_UUID);
+static const ble_uuid16_t ble_ui_tx_uuid = BLE_UUID16_INIT(BLE_UI_TX_UUID);
 #endif
 
 
 #if ENABLE_BLE
 
-static QueueHandle_t ble_rx_queue = nullptr;
+static QueueHandle_t ble_cmd_queue = nullptr;
 static uint16_t gatt_tx_handle = 0;
 static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static bool g_ble_synced = false;
+static bool g_ble_force_send = false;
+static std::string g_ble_adv_name;
+static std::string g_ble_last_payload;
+static int g_ble_last_countdown = -1;
 static const char* BT_TAG = "BLE_INIT";
 
 static int gap_cb(struct ble_gap_event *event, void *arg);
 static void nimble_host_task(void *param);
 static void ble_on_sync(void);
+static void ble_app_advertise(void);
+static void ble_update_name_from_station(bool restart_adv);
+static void ble_countdown_tick();
 
-// RX write callback (ok as you have)
-static int uart_rx_cb(uint16_t conn_handle,
-                      uint16_t attr_handle,
-                      struct ble_gatt_access_ctxt *ctxt,
-                      void *arg)
+static char ble_parse_ui_command(const uint8_t* data, uint16_t len)
 {
-    if (!ble_rx_queue) return 0;
-    ESP_LOGI(BT_TAG, "RX write cb: conn=%u len=%u", conn_handle, (unsigned)ctxt->om->om_len);
-    const uint8_t *p = ctxt->om->om_data;
-    uint16_t len = ctxt->om->om_len;
-    for (uint16_t i = 0; i < len; i++) {
-        uint8_t b = p[i];
-        xQueueSend(ble_rx_queue, &b, 0);
+    if (!data || len != 1) return 0;  // ignore multi-character payloads
+    char c = static_cast<char>(data[0]);
+    if (c >= 'a' && c <= 'z') c = static_cast<char>(c - ('a' - 'A'));
+
+    if (c >= '1' && c <= '6') return c;
+    switch (c) {
+      case 'S':
+      case 'R':
+      case 'T':
+      case 'M':
+      case 'Q':
+        return c;
+      case 'U':  // page up
+        return ';';
+      case 'V':  // page down
+        return '.';
+      default:
+        return 0;
     }
-    return 0;
 }
 
-// TX characteristic doesn't need reads/writes; return success.
-static int uart_tx_cb(uint16_t conn_handle,
-                      uint16_t attr_handle,
-                      struct ble_gatt_access_ctxt *ctxt,
-                      void *arg)
+static int ble_ui_rx_cb(uint16_t conn_handle,
+                        uint16_t attr_handle,
+                        struct ble_gatt_access_ctxt *ctxt,
+                        void *arg)
 {
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+    if (!ble_cmd_queue || !ctxt || !ctxt->om) return 0;
+    char cmd = ble_parse_ui_command(ctxt->om->om_data, ctxt->om->om_len);
+    if (cmd != 0) {
+      xQueueSend(ble_cmd_queue, &cmd, 0);
+    }
+    return 0;  // ignore unsupported input silently
+}
+
+static int ble_ui_tx_cb(uint16_t conn_handle,
+                        uint16_t attr_handle,
+                        struct ble_gatt_access_ctxt *ctxt,
+                        void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)ctxt;
+    (void)arg;
     return 0;
 }
 
 #include "esp_nimble_hci.h"   // <-- add
 
-// C++-safe static characteristics table
+// C++-safe static characteristics table (fully initialized for -Werror).
 static const struct ble_gatt_chr_def gatt_uart_chrs[] = {
     {
-        .uuid = &uart_rx_uuid.u,
-        .access_cb = uart_rx_cb,
-        .arg = nullptr,
-        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+        &ble_ui_rx_uuid.u,                       // uuid
+        ble_ui_rx_cb,                            // access_cb
+        nullptr,                                 // arg
+        nullptr,                                 // descriptors
+        BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP, // flags
+        0,                                       // min_key_size
+        nullptr,                                 // val_handle
+        nullptr,                                 // cpfd
     },
     {
-        .uuid = &uart_tx_uuid.u,              // <-- IMPORTANT: no BLE_UUID16_DECLARE here
-        .access_cb = uart_tx_cb,
-        .arg = nullptr,
-        .flags = BLE_GATT_CHR_F_NOTIFY,
-        .val_handle = &gatt_tx_handle,  // CCCD will follow
+        &ble_ui_tx_uuid.u,                       // uuid
+        ble_ui_tx_cb,                            // access_cb
+        nullptr,                                 // arg
+        nullptr,                                 // descriptors
+        BLE_GATT_CHR_F_NOTIFY,                   // flags
+        0,                                       // min_key_size
+        &gatt_tx_handle,                         // val_handle
+        nullptr,                                 // cpfd
     },
-    { 0 }  // terminator
+    {
+        nullptr,                                 // uuid terminator
+        nullptr,                                 // access_cb
+        nullptr,                                 // arg
+        nullptr,                                 // descriptors
+        0,                                       // flags
+        0,                                       // min_key_size
+        nullptr,                                 // val_handle
+        nullptr,                                 // cpfd
+    }
 };
 
-// C++-safe service table
+// C++-safe service table (fully initialized for -Werror).
 static const struct ble_gatt_svc_def gatt_svcs[] = {
     {
-        .type = BLE_GATT_SVC_TYPE_PRIMARY,
-        .uuid = &uart_svc_uuid.u,
-        .characteristics = gatt_uart_chrs,
+        BLE_GATT_SVC_TYPE_PRIMARY,               // type
+        &ble_ui_svc_uuid.u,                      // uuid
+        nullptr,                                 // includes
+        gatt_uart_chrs,                          // characteristics
     },
-    { 0 }  // terminator
+    {
+        0,                                       // type terminator
+        nullptr,                                 // uuid
+        nullptr,                                 // includes
+        nullptr,                                 // characteristics
+    }
 };
 
 
@@ -184,10 +237,10 @@ static void init_bluetooth(void)
     ble_svc_gatt_init();
     ESP_LOGI(BT_TAG, "GAP/GATT init done");
 
-    ble_rx_queue = xQueueCreate(256, 1);
-    assert(ble_rx_queue);
+    ble_cmd_queue = xQueueCreate(32, sizeof(char));
+    assert(ble_cmd_queue);
 
-    ble_svc_gap_device_name_set("PaperFT8");
+    ble_update_name_from_station(false);
 
     rc = ble_gatts_count_cfg(gatt_svcs);
     if (rc != 0) {
@@ -207,40 +260,42 @@ static void init_bluetooth(void)
     ESP_LOGI(BT_TAG, "Host task started");
 }
 
-
-static void ble_app_advertise(void);
-
 static int gap_cb(struct ble_gap_event *event, void *arg)
 {
+    (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             g_conn_handle = event->connect.conn_handle;
-            ESP_LOGI(BT_TAG, "GAP connect, handle=%u", g_conn_handle);
+            g_ble_force_send = true;
+            g_ble_last_countdown = -1;
+            ESP_LOGI(BT_TAG, "Connected, handle=%u", g_conn_handle);
         } else {
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            ESP_LOGW(BT_TAG, "GAP connect failed; restarting adv");
+            ESP_LOGW(BT_TAG, "Connect failed; restarting adv");
             ble_app_advertise();
         }
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        ESP_LOGW(BT_TAG, "GAP disconnect; restarting adv");
+        g_ble_last_payload.clear();
+        g_ble_last_countdown = -1;
+        ESP_LOGW(BT_TAG, "Disconnected; restarting adv");
         ble_app_advertise();
         break;
 
     default:
-        ESP_LOGI(BT_TAG, "GAP event type=%d", event->type);
         break;
     }
     return 0;
 }
 
 
-// BLE UART-style service (Nordic-like) UUIDs
-[[maybe_unused]] static uint8_t ble_rx_placeholder = 0;
-[[maybe_unused]] static uint8_t ble_tx_placeholder = 0;
+static bool ble_pop_command(char& out) {
+    if (!ble_cmd_queue) return false;
+    return xQueueReceive(ble_cmd_queue, &out, 0) == pdTRUE;
+}
 #endif // ENABLE_BLE
 
 int64_t rtc_now_ms();
@@ -773,7 +828,6 @@ static std::string g_time = "10:10:00";
 static int status_edit_idx = -1;     // 0-5
 static std::string status_edit_buffer;
 static int status_cursor_pos = -1;
-static void host_send_bt(const std::string& s);
 static std::vector<std::string> g_debug_lines;
 static int debug_page = 0;
 static const size_t DEBUG_MAX_LINES = 18; // 3 pages
@@ -786,7 +840,10 @@ static bool g_pending_tx_valid = false;
 static volatile bool g_tx_cancel_requested = false;
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
-static void poll_ble_uart();
+static bool ble_pop_command(char& out);
+static void ble_update_name_from_station(bool restart_adv);
+static void ble_mirror_tick();
+static void ble_countdown_tick();
 struct GestureEvent;
 static bool poll_gesture(GestureEvent& out);
 static UIMode swipe_next_mode(UIMode current, int dir);
@@ -1479,7 +1536,6 @@ static void host_write_str(const std::string& s) {
       remaining -= written;
     }
   }
-  host_send_bt(s);
 }
 
 struct WAVHeader {
@@ -1529,7 +1585,7 @@ struct WAVHeader {
   mon_cfg.f_min = 200.0f;
   mon_cfg.f_max = 3000.0f;
   mon_cfg.sample_rate = FT8_SAMPLE_RATE;
-  mon_cfg.time_osr = 1;
+  mon_cfg.time_osr = 2;
   mon_cfg.freq_osr = 2;
   mon_cfg.protocol = FTX_PROTOCOL_FT8;
 
@@ -2892,6 +2948,7 @@ static void touch_keyboard_commit_current() {
       if (menu_edit_idx == 3) {
         g_call = menu_edit_buf;
         autoseq_set_station(g_call, g_grid);
+        ble_update_name_from_station(true);
       } else if (menu_edit_idx == 4) {
         g_grid = menu_edit_buf;
         autoseq_set_station(g_call, g_grid);
@@ -3484,77 +3541,243 @@ static void debug_log_line(const std::string& msg) {
 
 #if ENABLE_BLE
 
-static void host_send_bt(const std::string& s)
-{
-    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-    if (!gatt_tx_handle) return;
-
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(s.data(), s.size());
-    if (!om) return;
-
-    ble_gatts_notify_custom(g_conn_handle, gatt_tx_handle, om);
+static int page_count(int items, int page_size) {
+  if (page_size <= 0) return 1;
+  if (items <= 0) return 1;
+  return (items + page_size - 1) / page_size;
 }
 
-static void ble_on_sync(void);
+static void ble_notify_payload(const std::string& payload) {
+  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+  if (!gatt_tx_handle) return;
+  struct os_mbuf* om = ble_hs_mbuf_from_flat(payload.data(), payload.size());
+  if (!om) return;
+  int rc = ble_gatts_notify_custom(g_conn_handle, gatt_tx_handle, om);
+  if (rc != 0) {
+    ESP_LOGD(BT_TAG, "notify failed rc=%d", rc);
+  }
+}
 
-static void ble_on_sync(void)
-{
-    int rc = ble_hs_util_ensure_addr(0);
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "ensure addr failed: %d", rc);
-        return;
+static std::string ble_mac_suffix() {
+  uint8_t mac[6] = {};
+  if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+    return "0000";
+  }
+  char out[5];
+  std::snprintf(out, sizeof(out), "%02X%02X", mac[4], mac[5]);
+  return std::string(out);
+}
+
+static std::string ble_sanitize_callsign(const std::string& call) {
+  std::string out;
+  out.reserve(call.size());
+  for (unsigned char ch : call) {
+    if (std::isalnum(ch)) {
+      out.push_back(static_cast<char>(std::toupper(ch)));
+    } else if (ch == '/' || ch == '_' || ch == '-') {
+      out.push_back('_');
     }
-    rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "infer auto addr failed: %d", rc);
-        return;
-    }
-    uint8_t addr_val[6];
-    ble_hs_id_copy_addr(g_own_addr_type, addr_val, NULL);
-    ESP_LOGI(BT_TAG, "Sync, address type %d, addr %02x:%02x:%02x:%02x:%02x:%02x",
-             g_own_addr_type,
-             addr_val[5], addr_val[4], addr_val[3], addr_val[2], addr_val[1], addr_val[0]);
+    if (out.size() >= 12) break;
+  }
+  while (!out.empty() && out.back() == '_') out.pop_back();
+  return out;
+}
+
+static void ble_update_name_from_station(bool restart_adv) {
+  std::string suffix = ble_sanitize_callsign(g_call);
+  if (suffix.empty()) suffix = ble_mac_suffix();
+  std::string desired = std::string("PaperFT8-") + suffix;
+  if (desired.size() > 24) desired.resize(24);
+  if (desired.empty()) desired = "PaperFT8";
+
+  if (desired == g_ble_adv_name) return;
+  g_ble_adv_name = desired;
+  ble_svc_gap_device_name_set(g_ble_adv_name.c_str());
+
+  if (restart_adv && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
     ble_app_advertise();
+  }
 }
 
-static void nimble_host_task(void *param)
-{
-    nimble_port_run();
-    nimble_port_freertos_deinit();
+static const char* ble_page_label(UIMode mode) {
+  switch (mode) {
+    case UIMode::RX: return "RX";
+    case UIMode::TX: return "TX";
+    case UIMode::BAND: return "BAND";
+    case UIMode::MENU: return "MENU";
+    case UIMode::HOST: return "HOST";
+    case UIMode::CONTROL: return "CONTROL";
+    case UIMode::DEBUG: return "DEBUG";
+    case UIMode::LIST: return "LIST";
+    case UIMode::STATUS: return "STATUS";
+    case UIMode::QSO: return "QSO";
+  }
+  return "PAGE";
 }
 
-static void ble_app_advertise(void)
-{
-    struct ble_gap_adv_params adv{};
-    adv.conn_mode = BLE_GAP_CONN_MODE_UND;
-    adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
+static void ble_page_meta(int& cur, int& total) {
+  cur = 1;
+  total = 1;
+  switch (ui_mode) {
+    case UIMode::RX:
+      ui_get_rx_page_info(cur, total);
+      break;
+    case UIMode::TX:
+      total = page_count(autoseq_queue_size(), 5);
+      cur = tx_page + 1;
+      break;
+    case UIMode::BAND:
+      total = page_count((int)g_bands.size(), 6);
+      cur = band_page + 1;
+      break;
+    case UIMode::MENU:
+      total = 3;
+      cur = menu_page + 1;
+      break;
+    case UIMode::DEBUG:
+      total = page_count((int)g_debug_lines.size(), 6);
+      cur = debug_page + 1;
+      break;
+    case UIMode::LIST:
+      total = page_count((int)g_list_lines.size(), 6);
+      cur = list_page + 1;
+      break;
+    case UIMode::QSO:
+      total = page_count((int)g_q_lines.size(), 6);
+      cur = q_page + 1;
+      break;
+    default:
+      break;
+  }
+  if (total < 1) total = 1;
+  if (cur < 1) cur = 1;
+  if (cur > total) cur = total;
+}
 
-    struct ble_hs_adv_fields fields{};
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.name = (uint8_t*)"PaperFT8";
-    fields.name_len = strlen("PaperFT8");
-    fields.name_is_complete = 1;
+static std::string ble_meta_line() {
+  int cur = 1;
+  int total = 1;
+  ble_page_meta(cur, total);
 
-    ble_gap_adv_stop();  // safe if not advertising
-    int rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "adv_set_fields failed: %d", rc);
-        return;
-    }
-    rc = ble_gap_adv_start(g_own_addr_type, nullptr,
-                           BLE_HS_FOREVER,
-                           &adv, gap_cb, nullptr);
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "adv_start failed: %d", rc);
-    } else {
-        ESP_LOGI(BT_TAG, "Advertising as PaperFT8");
-    }
+  char meta[48];
+  const char up = (cur > 1) ? 'u' : '-';
+  const char down = (cur < total) ? 'v' : '-';
+  std::snprintf(meta, sizeof(meta), "[%s %c/%c]", ble_page_label(ui_mode), up, down);
+  return std::string(meta);
+}
+
+static int ble_countdown_value() {
+  int64_t slot_ms = rtc_now_ms() % 15000;
+  if (slot_ms < 0) slot_ms += 15000;
+  int sec = (int)(slot_ms / 1000);
+  if (sec < 0) sec = 0;
+  if (sec > 14) sec = 14;
+  return sec;
+}
+
+static void ble_mirror_tick() {
+  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+
+  std::vector<std::string> lines;
+  ui_get_visible_text_lines(lines);
+  while ((int)lines.size() < 6) lines.push_back("");
+
+  const std::string meta = ble_meta_line();
+
+  std::string screen_key;
+  screen_key.reserve(256);
+  for (int i = 0; i < 6; ++i) {
+    screen_key += lines[i];
+    screen_key.push_back('\n');
+  }
+  screen_key += meta;
+  screen_key += " ";
+
+  const int countdown = ble_countdown_value();
+  char cd_buf[4];
+  std::snprintf(cd_buf, sizeof(cd_buf), "%d", countdown);
+
+  if (g_ble_force_send || screen_key != g_ble_last_payload) {
+    g_ble_force_send = false;
+    g_ble_last_payload = screen_key;
+    g_ble_last_countdown = countdown;
+    std::string out;
+    out.reserve(screen_key.size() + 40);
+    out += "\n==========================\n";
+    out += screen_key;
+    out += cd_buf;
+    ble_notify_payload(out);
+  }
+}
+
+static void ble_countdown_tick() {
+  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+  if (g_ble_last_countdown < 0) return;
+
+  const int countdown = ble_countdown_value();
+  if (countdown == g_ble_last_countdown) return;
+
+  ble_notify_payload(std::to_string(countdown));
+  g_ble_last_countdown = countdown;
+}
+
+static void ble_on_sync(void) {
+  int rc = ble_hs_util_ensure_addr(0);
+  if (rc != 0) {
+    ESP_LOGE(BT_TAG, "ensure addr failed: %d", rc);
+    return;
+  }
+  rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
+  if (rc != 0) {
+    ESP_LOGE(BT_TAG, "infer auto addr failed: %d", rc);
+    return;
+  }
+  g_ble_synced = true;
+  ble_update_name_from_station(false);
+  ble_app_advertise();
+}
+
+static void nimble_host_task(void* param) {
+  (void)param;
+  nimble_port_run();
+  nimble_port_freertos_deinit();
+}
+
+static void ble_app_advertise(void) {
+  if (!g_ble_synced) return;
+  if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
+
+  struct ble_gap_adv_params adv{};
+  adv.conn_mode = BLE_GAP_CONN_MODE_UND;
+  adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
+
+  struct ble_hs_adv_fields fields{};
+  fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+  const std::string name = g_ble_adv_name.empty() ? std::string("PaperFT8") : g_ble_adv_name;
+  fields.name = (uint8_t*)name.c_str();
+  fields.name_len = name.size();
+  fields.name_is_complete = 1;
+
+  ble_gap_adv_stop();
+  int rc = ble_gap_adv_set_fields(&fields);
+  if (rc != 0) {
+    ESP_LOGE(BT_TAG, "adv_set_fields failed: %d", rc);
+    return;
+  }
+  rc = ble_gap_adv_start(g_own_addr_type, nullptr, BLE_HS_FOREVER, &adv, gap_cb, nullptr);
+  if (rc != 0) {
+    ESP_LOGE(BT_TAG, "adv_start failed: %d", rc);
+  } else {
+    ESP_LOGI(BT_TAG, "Advertising as %s", name.c_str());
+  }
 }
 
 #else  // ENABLE_BLE
-static void host_send_bt(const std::string& s) { (void)s; }
+static bool ble_pop_command(char& out) { (void)out; return false; }
+static void ble_update_name_from_station(bool restart_adv) { (void)restart_adv; }
+static void ble_mirror_tick() {}
+static void ble_countdown_tick() {}
 static void init_bluetooth(void) {}
-[[maybe_unused]] static void poll_ble_uart() {}
 #endif // ENABLE_BLE
 
 static std::string trim_copy(const std::string& s) {
@@ -3911,37 +4134,6 @@ static void poll_host_uart() {
   }
 }
 
-#if ENABLE_BLE
-static void poll_ble_uart() {
-  if (!ble_rx_queue) return;
-  uint8_t buf[256];
-  size_t n = 0;
-  uint8_t b = 0;
-  while (xQueueReceive(ble_rx_queue, &b, 0) == pdTRUE) {
-    buf[n++] = b;
-    if (n == sizeof(buf)) {
-      ESP_LOGI(BT_TAG, "BLE RX chunk %u bytes", (unsigned)n);
-      host_process_bytes(buf, n);
-      // If no newline was seen, synthesize one to flush short commands over BLE.
-      if (!host_bin_active && n > 0 && buf[n - 1] != '\n' && buf[n - 1] != '\r') {
-        const uint8_t nl = '\n';
-        host_process_bytes(&nl, 1);
-      }
-      n = 0;
-    }
-  }
-  if (n > 0) {
-    ESP_LOGI(BT_TAG, "BLE RX chunk %u bytes", (unsigned)n);
-    host_process_bytes(buf, n);
-    if (!host_bin_active && buf[n - 1] != '\n' && buf[n - 1] != '\r') {
-      const uint8_t nl = '\n';
-      host_process_bytes(&nl, 1);
-    }
-  }
-}
-
-#endif // ENABLE_BLE
-
 static void load_station_data() {
   // If Station.ini exists on SD, prefer it by copying onto SPIFFS first.
   // If mount/copy fails, fall back to the on-device SPIFFS Station.ini.
@@ -4202,6 +4394,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
+  init_bluetooth();   // runs on core0 after station data is loaded (for BLE naming)
   update_autoseq_cq_type();
 
   // Update autoseq with station info after loading
@@ -4238,6 +4431,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   while (true) {
     M5.update();
     char c = 0;
+    bool c_from_ble = false;
     if (!touch_keyboard_active() && g_touchkbd_target != TouchKbdEditTarget::None) {
       touch_keyboard_end_session();
     }
@@ -4281,9 +4475,22 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         last_key = 0;  // Reset debounce so same-key injection works
       }
     }
+    if (c == 0) {
+      char ble_cmd = 0;
+      if (ble_pop_command(ble_cmd)) {
+        c = ble_cmd;
+        c_from_ble = true;
+        last_key = 0;  // allow repeated BLE commands without local debounce suppression
+      }
+    }
     if (touch_keyboard_active()) {
       c = 0;  // Touch keyboard owns edit input while active.
     }
+
+    // BLE remote UI push model: always compare and send latest 7-line snapshot when changed.
+    ble_mirror_tick();
+    ble_countdown_tick();
+
     // Startup screen overlay on RX page: show until any key press, and only once
     if (g_startup_active) {
       if (c == 0) {
@@ -4357,7 +4564,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     continue;
   }
 
-  // CONTROL mode: legacy host serial protocol over USB (and BLE)
+  // CONTROL mode: legacy host serial protocol over USB only
   if (ui_mode == UIMode::CONTROL) {
     poll_host_uart();
     if (host_bin_active) { // block keyboard exits during binary upload
@@ -4600,6 +4807,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         break;
       }
         case UIMode::BAND: {
+          if (c_from_ble && band_edit_idx >= 0) {
+            break;  // BLE does not participate in band frequency text edit.
+          }
           if (band_edit_idx >= 0) {
             if (c >= '0' && c <= '9') { band_edit_buffer.push_back(c); draw_band_view(); }
             else if (c == 0x08 || c == 0x7f) {
@@ -4620,6 +4830,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             } else if (c == '.') {
               if ((band_page + 1) * 6 < (int)g_bands.size()) { band_page++; draw_band_view(); }
             } else if (c >= '1' && c <= '6') {
+              if (c_from_ble) break;  // BLE must not enter band frequency text edit.
               int idx = band_page * 6 + (c - '1');
               if (idx >= 0 && idx < (int)g_bands.size()) {
                 band_edit_idx = idx;
@@ -4631,6 +4842,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           break;
         }
         case UIMode::STATUS: {
+        if (c_from_ble && status_edit_idx != -1) {
+          break;  // BLE does not participate in any status edit flow.
+        }
         if (status_edit_idx == -1) {
           if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
@@ -4697,8 +4911,22 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 }
                 draw_status_view();
               }
-              else if (c == '5') { status_edit_idx = 4; status_edit_buffer = digits_only_limited(g_date, 8); status_cursor_pos = 0; draw_status_view(); }
-              else if (c == '6') { status_edit_idx = 5; status_edit_buffer = digits_only_limited(g_time, 6); status_cursor_pos = 0; draw_status_view(); }
+              else if (c == '5') {
+                if (!c_from_ble) {
+                  status_edit_idx = 4;
+                  status_edit_buffer = digits_only_limited(g_date, 8);
+                  status_cursor_pos = 0;
+                  draw_status_view();
+                }
+              }
+              else if (c == '6') {
+                if (!c_from_ble) {
+                  status_edit_idx = 5;
+                  status_edit_buffer = digits_only_limited(g_time, 6);
+                  status_cursor_pos = 0;
+                  draw_status_view();
+                }
+              }
             } else {
               if (status_edit_idx == 1) {
                 if (c == '`') { status_edit_idx = -1; status_edit_buffer.clear(); draw_status_view(); }
@@ -4797,6 +5025,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         case UIMode::HOST:
         case UIMode::MENU: {
           if (ui_mode == UIMode::MENU) {
+            if (c_from_ble && (menu_long_edit || menu_edit_idx >= 0)) {
+              break;  // BLE does not support text edit input.
+            }
             if (menu_long_edit) {
               if (c == '\n' || c == '\r') {
                 if (menu_long_kind == LONG_FT) {
@@ -4851,6 +5082,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   if (v < 0) v = 0;
                   g_autoseq_max_retry = v;
                   autoseq_set_max_retry(g_autoseq_max_retry);
+                }
+                if (menu_edit_idx == 3) {
+                  ble_update_name_from_station(true);
                 }
                 save_station_data();
                 menu_edit_idx = -1;
@@ -4928,16 +5162,19 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   }
                 }
               } else if (c == '3') {
+                if (c_from_ble) break;
                 menu_long_edit = true;
                 menu_long_kind = LONG_FT;
                 menu_long_buf = g_free_text;
                 menu_long_backup = g_free_text;
                 draw_menu_view();
               } else if (c == '4') {
+                if (c_from_ble) break;
                 menu_edit_idx = 3; // Call (line index 3)
                 menu_edit_buf = g_call;
                 draw_menu_view();
               } else if (c == '5') {
+                if (c_from_ble) break;
                 menu_edit_idx = 4; // Grid (line index 4)
                 menu_edit_buf = g_grid;
                 draw_menu_view();
@@ -4969,6 +5206,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '2') {
+                  if (c_from_ble) break;
                   menu_edit_idx = 7; // Cursor line
                   menu_edit_buf = std::to_string(g_offset_hz);
                   draw_menu_view();
@@ -4977,12 +5215,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '4') {
+                  if (c_from_ble) break;
                   menu_long_edit = true;
                   menu_long_kind = LONG_IGNORE;
                   menu_long_buf = g_ignore_prefix_text;
                   menu_long_backup = g_ignore_prefix_text;
                   draw_menu_view();
                 } else if (c == '5') {
+                  if (c_from_ble) break;
                   menu_long_edit = true;
                   menu_long_kind = LONG_COMMENT;
                   menu_long_buf = g_comment1;
@@ -5000,12 +5240,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 save_station_data();
                 draw_menu_view();
               } else if (c == '3') {
+                if (c_from_ble) break;
                 menu_long_edit = true;
                 menu_long_kind = LONG_ACTIVE;
                 menu_long_buf = g_active_band_text;
                 menu_long_backup = g_active_band_text;
                 draw_menu_view();
               } else if (c == '4') {
+                if (c_from_ble) break;
                 menu_edit_idx = 15; // Max Retry line
                 menu_edit_buf = std::to_string(g_autoseq_max_retry);
                 draw_menu_view();
@@ -5038,9 +5280,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 }
 
 extern "C" void app_main(void) {
-  // Run the main application loop on core0; BLE host stays on core0.
+  // Run the main application loop on core0.
   xTaskCreatePinnedToCore(app_task_core0, "app_core0", 12288, nullptr, 5, nullptr, 0);
-  init_bluetooth();   // runs on core0
 }
 static void draw_status_line(int idx, const std::string& text, bool highlight) {
   const UiLayout& lay = ui_layout();
@@ -5054,6 +5295,7 @@ static void draw_status_line(int idx, const std::string& text, bool highlight) {
   M5.Display.setTextSize(4);
   char buf[160];
   std::snprintf(buf, sizeof(buf), "%d %c%s", idx + 1, highlight ? '>' : ' ', text.c_str());
+  ui_set_visible_text_line(idx, buf);
   M5.Display.drawString(buf, 24, y + (line_h / 2));
 }
 [[maybe_unused]] static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging) {
@@ -5081,4 +5323,3 @@ static void draw_status_line(int idx, const std::string& text, bool highlight) {
   }
   M5.Display.endWrite();
 }
-
