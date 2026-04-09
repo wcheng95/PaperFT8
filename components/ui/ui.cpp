@@ -96,7 +96,14 @@ static uint8_t g_waterfall_band_bitmap[kWaterfallBandBitmapBytes] = {};
 static std::vector<UiRxLine> rx_lines;
 static int rx_page = 0;
 static int rx_selected = -1;
-static std::vector<UiRxLine> last_drawn_lines;
+struct RxDrawCacheEntry {
+    std::string text;
+    int snr = 0;
+    int offset_hz = 0;
+    bool is_cq = false;
+    bool is_to_me = false;
+};
+static std::vector<RxDrawCacheEntry> last_drawn_cache;
 static int last_page = -1;
 static std::string g_visible_rows[RX_LINES];
 
@@ -740,12 +747,12 @@ void ui_set_rx_list(const std::vector<UiRxLine>& lines) {
     rx_lines = lines;
     rx_page = 0;
     rx_selected = -1;
-    last_drawn_lines.clear();
+    last_drawn_cache.clear();
     last_page = -1;
 }
 
 void ui_force_redraw_rx() {
-    last_drawn_lines.clear();
+    last_drawn_cache.clear();
     last_page = -1;
 }
 
@@ -768,14 +775,14 @@ static bool draw_rx_abs_line_locked(int absolute_idx, bool highlight) {
 
 void ui_draw_rx(int flash_index) {
     if (!rx_lines.empty() && flash_index < 0) {
-        if (rx_page == last_page && last_drawn_lines.size() == rx_lines.size()) {
+        if (rx_page == last_page && last_drawn_cache.size() == rx_lines.size()) {
             bool same = true;
             for (size_t i = 0; i < rx_lines.size(); ++i) {
-                if (rx_lines[i].text != last_drawn_lines[i].text ||
-                    rx_lines[i].snr != last_drawn_lines[i].snr ||
-                    rx_lines[i].offset_hz != last_drawn_lines[i].offset_hz ||
-                    rx_lines[i].is_cq != last_drawn_lines[i].is_cq ||
-                    rx_lines[i].is_to_me != last_drawn_lines[i].is_to_me) {
+                if (rx_lines[i].text != last_drawn_cache[i].text ||
+                    rx_lines[i].snr != last_drawn_cache[i].snr ||
+                    rx_lines[i].offset_hz != last_drawn_cache[i].offset_hz ||
+                    rx_lines[i].is_cq != last_drawn_cache[i].is_cq ||
+                    rx_lines[i].is_to_me != last_drawn_cache[i].is_to_me) {
                     same = false;
                     break;
                 }
@@ -805,10 +812,17 @@ void ui_draw_rx(int flash_index) {
 
     if (flash_index < 0) {
         last_page = rx_page;
-        last_drawn_lines = rx_lines;
+        last_drawn_cache.resize(rx_lines.size());
+        for (size_t i = 0; i < rx_lines.size(); ++i) {
+            last_drawn_cache[i].text = rx_lines[i].text;
+            last_drawn_cache[i].snr = rx_lines[i].snr;
+            last_drawn_cache[i].offset_hz = rx_lines[i].offset_hz;
+            last_drawn_cache[i].is_cq = rx_lines[i].is_cq;
+            last_drawn_cache[i].is_to_me = rx_lines[i].is_to_me;
+        }
     } else {
         last_page = -1;
-        last_drawn_lines.clear();
+        last_drawn_cache.clear();
     }
 }
 
