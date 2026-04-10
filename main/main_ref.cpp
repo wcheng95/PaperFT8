@@ -1222,6 +1222,45 @@ static bool format_time_digits_exact(const std::string& digits, std::string& out
   return true;
 }
 
+static std::string uppercase_ascii_copy(std::string text) {
+  for (char& ch : text) {
+    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  }
+  return text;
+}
+
+static bool menu_long_allows_mixed_case() {
+  return menu_long_kind == LONG_COMMENT;
+}
+
+static bool menu_edit_allows_mixed_case(int idx) {
+  return idx == 10;
+}
+
+static std::string normalize_menu_long_case(const std::string& text) {
+  if (menu_long_allows_mixed_case()) {
+    return text;
+  }
+  return uppercase_ascii_copy(text);
+}
+
+static std::string normalize_menu_edit_case(int idx, const std::string& text) {
+  if (menu_edit_allows_mixed_case(idx)) {
+    return text;
+  }
+  return uppercase_ascii_copy(text);
+}
+
+static bool touch_keyboard_case_toggle_enabled_for_target(TouchKbdEditTarget target) {
+  if (target == TouchKbdEditTarget::MenuLong) {
+    return menu_long_allows_mixed_case();
+  }
+  if (target == TouchKbdEditTarget::MenuEdit) {
+    return menu_edit_allows_mixed_case(menu_edit_idx);
+  }
+  return false;
+}
+
 static void draw_status_view();
 static void draw_status_line(int idx, const std::string& text, bool highlight);
 static void draw_touch_keyboard_overlay(const std::string& header);
@@ -3022,13 +3061,13 @@ static void touch_keyboard_apply_buffer_shadow() {
   switch (g_touchkbd_target) {
     case TouchKbdEditTarget::MenuLong:
       if (menu_long_kind == LONG_IGNORE) {
-        menu_long_buf = clamp_ignore_prefix_text(text);
+        menu_long_buf = clamp_ignore_prefix_text(normalize_menu_long_case(text));
       } else {
-        menu_long_buf = text;
+        menu_long_buf = normalize_menu_long_case(text);
       }
       break;
     case TouchKbdEditTarget::MenuEdit:
-      menu_edit_buf = text;
+      menu_edit_buf = normalize_menu_edit_case(menu_edit_idx, text);
       break;
     case TouchKbdEditTarget::BandFreq:
       band_edit_buffer = text;
@@ -3106,18 +3145,31 @@ static void touch_keyboard_begin_session(TouchKbdEditTarget target,
 
   touch_keyboard_end_session();
 
-  size_t copy_len = std::min(initial_text.size(), sizeof(g_touchkbd_buffer) - 1);
-  memcpy(g_touchkbd_buffer, initial_text.data(), copy_len);
+  std::string normalized_initial = initial_text;
+  if (target == TouchKbdEditTarget::MenuLong) {
+    normalized_initial = normalize_menu_long_case(normalized_initial);
+    if (menu_long_kind == LONG_IGNORE) {
+      normalized_initial = clamp_ignore_prefix_text(normalized_initial);
+    }
+  } else if (target == TouchKbdEditTarget::MenuEdit) {
+    normalized_initial = normalize_menu_edit_case(menu_edit_idx, normalized_initial);
+  }
+
+  size_t copy_len = std::min(normalized_initial.size(), sizeof(g_touchkbd_buffer) - 1);
+  memcpy(g_touchkbd_buffer, normalized_initial.data(), copy_len);
   g_touchkbd_buffer[copy_len] = '\0';
 
   g_touchkbd_target = target;
   g_touchkbd_header = header;
 
+  touchkbd::TouchKeyboard& keyboard = touch_keyboard_instance();
   touch_keyboard_set_bounds();
-  if (!touch_keyboard_instance().attachBuffer(g_touchkbd_buffer, sizeof(g_touchkbd_buffer))) {
+  if (!keyboard.attachBuffer(g_touchkbd_buffer, sizeof(g_touchkbd_buffer))) {
     g_touchkbd_target = TouchKbdEditTarget::None;
     return;
   }
+  keyboard.setCaseToggleEnabled(touch_keyboard_case_toggle_enabled_for_target(target));
+  keyboard.setLowercaseMode(false);
 
   touch_keyboard_apply_buffer_shadow();
 }
@@ -4672,6 +4724,12 @@ static void load_station_data() {
     }
   }
   fclose(f);
+  g_cq_freetext = uppercase_ascii_copy(g_cq_freetext);
+  g_free_text = uppercase_ascii_copy(g_free_text);
+  g_call = uppercase_ascii_copy(g_call);
+  g_grid = uppercase_ascii_copy(g_grid);
+  g_ignore_prefix_text = clamp_ignore_prefix_text(uppercase_ascii_copy(g_ignore_prefix_text));
+  g_active_band_text = uppercase_ascii_copy(g_active_band_text);
   autoseq_set_max_retry(g_autoseq_max_retry);
   // Try hardware RTC first (persists through deep sleep), fall back to saved strings
   if (!rtc_init_from_hw()) {
@@ -4861,6 +4919,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
   if (menu_long_edit) {
     const size_t kTouchTextMax = sizeof(g_touchkbd_buffer) - 1;
     if (value.size() > kTouchTextMax) value.resize(kTouchTextMax);
+    value = normalize_menu_long_case(value);
     if (menu_long_kind == LONG_IGNORE && value.size() > kIgnorePrefixTextMaxLen) {
       value.resize(kIgnorePrefixTextMaxLen);
     }
@@ -4891,7 +4950,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
   if (menu_edit_idx >= 0) {
     const size_t max_len = (menu_edit_idx == 7 || menu_edit_idx == 15) ? 10 : (sizeof(g_touchkbd_buffer) - 1);
     if (value.size() > max_len) value.resize(max_len);
-    menu_edit_buf = value;
+    menu_edit_buf = normalize_menu_edit_case(menu_edit_idx, value);
 
     // Absolute indices across pages.
     if (menu_edit_idx == 3) {
@@ -5685,7 +5744,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 draw_menu_view();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
-                if (menu_long_kind == LONG_FT || menu_long_kind == LONG_IGNORE) {
+                if (!menu_long_allows_mixed_case()) {
                   ch = toupper((unsigned char)ch);
                 }
                 if (!(menu_long_kind == LONG_IGNORE &&
@@ -5730,7 +5789,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 if (menu_edit_idx == 7 && !((ch >= '0' && ch <= '9') || ch == '-')) {
                   break;
                 }
-                if (menu_edit_idx % 6 == 3 || menu_edit_idx % 6 == 4 || menu_edit_idx % 6 == 5) {
+                if (!menu_edit_allows_mixed_case(menu_edit_idx)) {
                   ch = toupper((unsigned char)ch);
                 }
                 menu_edit_buf.push_back(ch);

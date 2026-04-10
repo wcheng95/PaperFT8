@@ -52,7 +52,7 @@ constexpr LayoutEntry kLayout[TouchKeyboard::kLayoutRows][TouchKeyboard::kLayout
      {"L", KeyKind::Character, 'L'},
      {"/", KeyKind::Character, '/'},
      {"?", KeyKind::Character, '?'},
-     {"CLR", KeyKind::ClearWordLeft, 0}},
+     {"UC", KeyKind::ToggleCase, 0}},
 
     {{"Z", KeyKind::Character, 'Z'},
      {"X", KeyKind::Character, 'X'},
@@ -192,11 +192,13 @@ void TouchKeyboard::drawAll() {
   renderer_->drawKeyboardBackground(bounds_);
   for (size_t i = 0; i < kKeyCount; ++i) {
     const auto& key = keys_[i];
+    KeyDef draw_key = key;
+    draw_key.label = resolveKeyLabel(key);
     KeyVisualState state;
     state.pressed = (static_cast<int>(i) == pressedKeyIndex_);
     state.control = (key.kind != KeyKind::Character);
     state.repeatable = isRepeatableKey(key);
-    renderer_->drawKey(key, state);
+    renderer_->drawKey(draw_key, state);
   }
   clearDirty();
 }
@@ -212,11 +214,13 @@ void TouchKeyboard::redrawDirty() {
   for (size_t i = 0; i < kKeyCount; ++i) {
     if (!keyDirty_[i]) continue;
     const auto& key = keys_[i];
+    KeyDef draw_key = key;
+    draw_key.label = resolveKeyLabel(key);
     KeyVisualState state;
     state.pressed = (static_cast<int>(i) == pressedKeyIndex_);
     state.control = (key.kind != KeyKind::Character);
     state.repeatable = isRepeatableKey(key);
-    renderer_->drawKey(key, state);
+    renderer_->drawKey(draw_key, state);
     keyDirty_[i] = false;
   }
 }
@@ -317,6 +321,31 @@ void TouchKeyboard::commitEdit() {
   markAllDirty();
 }
 
+void TouchKeyboard::setCaseToggleEnabled(bool enabled) {
+  if (caseToggleEnabled_ == enabled) return;
+
+  caseToggleEnabled_ = enabled;
+  if (!caseToggleEnabled_) {
+    lowercaseMode_ = false;
+  }
+
+  const int key_index = findKeyIndexByKind(KeyKind::ToggleCase);
+  if (key_index >= 0) {
+    markKeyDirty(key_index);
+  }
+}
+
+void TouchKeyboard::setLowercaseMode(bool lowercase) {
+  const bool normalized = caseToggleEnabled_ && lowercase;
+  if (lowercaseMode_ == normalized) return;
+
+  lowercaseMode_ = normalized;
+  const int key_index = findKeyIndexByKind(KeyKind::ToggleCase);
+  if (key_index >= 0) {
+    markKeyDirty(key_index);
+  }
+}
+
 bool TouchKeyboard::isRepeatableKey(const KeyDef& key) const {
   if (key.kind == KeyKind::Backspace) return true;
   if (key.kind == KeyKind::MoveLeft) return true;
@@ -367,6 +396,23 @@ void TouchKeyboard::markKeyDirty(int keyIndex) {
   keyDirty_[static_cast<size_t>(keyIndex)] = true;
 }
 
+int TouchKeyboard::findKeyIndexByKind(KeyKind kind) const {
+  for (size_t i = 0; i < kKeyCount; ++i) {
+    if (keys_[i].kind == kind) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+const char* TouchKeyboard::resolveKeyLabel(const KeyDef& key) const {
+  if (key.kind != KeyKind::ToggleCase) {
+    return key.label;
+  }
+  if (!caseToggleEnabled_) {
+    return "UC";
+  }
+  return lowercaseMode_ ? "lc" : "UC";
+}
+
 void TouchKeyboard::notifyBufferChanged() {
   host_.onBufferChanged(bufferState());
 }
@@ -377,26 +423,30 @@ bool TouchKeyboard::applyKeyAction(int keyIndex, bool, bool wordAccelerated) {
   }
 
   const KeyDef& key = keys_[static_cast<size_t>(keyIndex)];
-  bool changed = false;
+  bool buffer_changed = false;
+  bool action_handled = false;
 
   switch (key.kind) {
     case KeyKind::Character:
-      changed = insertChar(key.literal);
+      buffer_changed = insertChar(key.literal);
       break;
     case KeyKind::Space:
-      changed = insertChar(' ');
+      buffer_changed = insertChar(' ');
       break;
     case KeyKind::Backspace:
-      changed = doBackspace();
+      buffer_changed = doBackspace();
       break;
     case KeyKind::MoveLeft:
-      changed = moveCursorLeft(wordAccelerated);
+      buffer_changed = moveCursorLeft(wordAccelerated);
       break;
     case KeyKind::MoveRight:
-      changed = moveCursorRight(wordAccelerated);
+      buffer_changed = moveCursorRight(wordAccelerated);
       break;
-    case KeyKind::ClearWordLeft:
-      changed = clearWordToLeft();
+    case KeyKind::ToggleCase:
+      if (caseToggleEnabled_) {
+        setLowercaseMode(!lowercaseMode_);
+        action_handled = true;
+      }
       break;
     case KeyKind::Escape:
       cancelEdit();
@@ -406,16 +456,25 @@ bool TouchKeyboard::applyKeyAction(int keyIndex, bool, bool wordAccelerated) {
       return true;
   }
 
-  if (changed) {
+  if (buffer_changed) {
     updateViewportForCursor();
     notifyBufferChanged();
   }
-  return changed;
+  return buffer_changed || action_handled;
 }
 
 bool TouchKeyboard::insertChar(char ch) {
   if (!hasBuffer()) return false;
   if (length_ + 1 >= capacity_) return false;
+
+  const unsigned char uch = static_cast<unsigned char>(ch);
+  if (std::isalpha(uch) != 0) {
+    if (caseToggleEnabled_ && lowercaseMode_) {
+      ch = static_cast<char>(std::tolower(uch));
+    } else {
+      ch = static_cast<char>(std::toupper(uch));
+    }
+  }
 
   std::memmove(buffer_ + cursor_ + 1, buffer_ + cursor_, (length_ - cursor_) + 1);
   buffer_[cursor_] = ch;
@@ -475,22 +534,6 @@ bool TouchKeyboard::moveCursorRight(bool byWord) {
 
   if (i == cursor_) return false;
   cursor_ = i;
-  return true;
-}
-
-bool TouchKeyboard::clearWordToLeft() {
-  if (!hasBuffer()) return false;
-  if (cursor_ == 0) return false;
-
-  size_t start = cursor_;
-  while (start > 0 && isSpaceChar(buffer_[start - 1])) --start;
-  while (start > 0 && !isSpaceChar(buffer_[start - 1])) --start;
-
-  if (start == cursor_) return false;
-  size_t removeCount = cursor_ - start;
-  std::memmove(buffer_ + start, buffer_ + cursor_, (length_ - cursor_) + 1);
-  length_ -= removeCount;
-  cursor_ = start;
   return true;
 }
 

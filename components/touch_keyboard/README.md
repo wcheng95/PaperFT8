@@ -13,7 +13,7 @@ No LVGL dependency exists in the core. If needed, keep LVGL in a renderer/host a
 
 1. `1 2 3 4 5 6 7 8 9 0 BS ESC`
 2. `Q W E R T Y U I O P <-- -->`
-3. `A S D F G H J K L / ? CLR`
+3. `A S D F G H J K L / ? UC`
 4. `Z X C V B N M + - . SPC ENTER`
 
 ## Behavior summary
@@ -24,6 +24,10 @@ No LVGL dependency exists in the core. If needed, keep LVGL in a renderer/host a
 - Long-press repeat:
   - enabled for `BS`, `<--`, `-->`
   - optional for `SPC` (`Config::repeatSpace`, default `false`)
+- `UC` key:
+  - host-controlled case toggle key
+  - when enabled, key label is `UC`/`lc` and toggles letter case
+  - when disabled, key stays `UC` and acts as a no-op
 - Recommended defaults (configurable):
   - first repeat delay: `450 ms`
   - repeat period: `80 ms`

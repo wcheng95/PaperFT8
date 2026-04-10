@@ -23,7 +23,7 @@ enum class KeyKind : uint8_t {
   Escape,
   MoveLeft,
   MoveRight,
-  ClearWordLeft,
+  ToggleCase,
   Space,
   Enter,
 };
@@ -129,6 +129,9 @@ class TouchKeyboard {
   const KeyDef& keyDef(size_t index) const { return keys_[index]; }
 
   bool isEditing() const { return editingActive_; }
+  void setCaseToggleEnabled(bool enabled);
+  void setLowercaseMode(bool lowercase);
+  bool isLowercaseMode() const { return lowercaseMode_; }
 
  private:
   bool hasBuffer() const { return buffer_ != nullptr && capacity_ > 0; }
@@ -146,7 +149,8 @@ class TouchKeyboard {
   bool doBackspace();
   bool moveCursorLeft(bool byWord);
   bool moveCursorRight(bool byWord);
-  bool clearWordToLeft();
+  int findKeyIndexByKind(KeyKind kind) const;
+  const char* resolveKeyLabel(const KeyDef& key) const;
 
   void refreshSnapshotFromBuffer();
   void restoreBufferFromSnapshot();
@@ -186,7 +190,9 @@ class TouchKeyboard {
 
   bool dirtyAll_ = true;
   std::array<bool, kKeyCount> keyDirty_ {};
+
+  bool caseToggleEnabled_ = false;
+  bool lowercaseMode_ = false;
 };
 
 }  // namespace touchkbd
-
