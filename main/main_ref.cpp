@@ -114,6 +114,35 @@ static bool g_ble_text_mode = false;
 static uint8_t g_own_addr_type = 0;
 static const char* BT_TAG = "BLE_INIT";
 
+enum class BleDumpTxMode : uint8_t {
+    Notify = 0,
+    Indicate = 1,
+};
+
+struct BleDumpTransferState {
+    bool active = false;
+    BleDumpTxMode mode = BleDumpTxMode::Notify;
+    int file_lines = 0;
+    int retries = 0;
+    int failed_lines = 0;
+    int notify_pace_ms = 8;
+    uint16_t mtu = 23;
+};
+
+static BleDumpTransferState g_ble_dump_xfer{};
+static volatile bool g_ble_tx_notify_enabled = false;
+static volatile bool g_ble_tx_indicate_enabled = false;
+static volatile bool g_ble_indicate_waiting = false;
+static volatile int g_ble_indicate_status = 0;
+static volatile uint16_t g_ble_att_mtu = 23;
+
+static constexpr int kBleDumpIndicateAckTimeoutMs = 1500;
+static constexpr int kBleDumpIndicateMaxRetries = 3;
+static constexpr int kBleDumpNotifyMaxRetries = 4;
+static constexpr int kBleDumpNotifyBackoffMs[kBleDumpNotifyMaxRetries] = {5, 10, 20, 40};
+static constexpr int kBleDumpNotifyPaceMinMs = 8;
+static constexpr int kBleDumpNotifyPaceMaxMs = 20;
+
 static int gap_cb(struct ble_gap_event *event, void *arg);
 static void nimble_host_task(void *param);
 static void ble_on_sync(void);
@@ -125,6 +154,10 @@ static bool ble_ensure_nvs_ready(void);
 static void ble_reset_runtime_state(void);
 static void ble_delete_cmd_queue(void);
 static void ble_countdown_tick();
+static int ble_send_payload_raw(const std::string& payload, bool indicate);
+static bool ble_wait_for_indicate_ack(int timeout_ms);
+static void ble_dump_reset_transfer_state(bool use_indicate);
+static bool ble_dump_send_line(const std::string& raw);
 
 static std::string ble_trim_trailing_crlf(const char* data, uint16_t len)
 {
@@ -149,7 +182,7 @@ static char ble_parse_ui_command(const char* data, uint16_t len)
       case 'M':
       case 'Q':
       case 'B':
-      case 'C':
+      case 'F':
       case 'D':
       case 'N':
       case 'O':
@@ -201,7 +234,7 @@ static int ble_ui_tx_cb(uint16_t conn_handle,
     return 0;
 }
 
-#include "esp_nimble_hci.h"   // <-- add
+#include "esp_nimble_hci.h"
 
 // C++-safe static characteristics table (fully initialized for -Werror).
 static const struct ble_gatt_chr_def gatt_uart_chrs[] = {
@@ -220,7 +253,7 @@ static const struct ble_gatt_chr_def gatt_uart_chrs[] = {
         ble_ui_tx_cb,                            // access_cb
         nullptr,                                 // arg
         nullptr,                                 // descriptors
-        BLE_GATT_CHR_F_NOTIFY,                   // flags
+        BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_INDICATE, // flags
         0,                                       // min_key_size
         &gatt_tx_handle,                         // val_handle
         nullptr,                                 // cpfd
@@ -234,7 +267,7 @@ static const struct ble_gatt_chr_def gatt_uart_chrs[] = {
         0,                                       // min_key_size
         nullptr,                                 // val_handle
         nullptr,                                 // cpfd
-    }
+    },
 };
 
 // C++-safe service table (fully initialized for -Werror).
@@ -272,6 +305,12 @@ static void ble_reset_runtime_state(void) {
     g_ble_qso_pick_mode = false;
     g_ble_dump_in_progress = false;
     g_own_addr_type = 0;
+    g_ble_tx_notify_enabled = false;
+    g_ble_tx_indicate_enabled = false;
+    g_ble_indicate_waiting = false;
+    g_ble_indicate_status = 0;
+    g_ble_att_mtu = 23;
+    g_ble_dump_xfer = BleDumpTransferState{};
 }
 
 static bool ble_ensure_nvs_ready(void) {
@@ -318,7 +357,6 @@ static bool ble_stack_start(void) {
         nimble_port_deinit();
         return false;
     }
-
     ble_update_name_from_station(false);
 
     rc = ble_gatts_count_cfg(gatt_svcs);
@@ -340,7 +378,6 @@ static bool ble_stack_start(void) {
     ESP_LOGI(BT_TAG, "Services added");
 
     ble_hs_cfg.sync_cb = ble_on_sync;
-
     nimble_port_freertos_init(nimble_host_task);
     g_ble_force_send = true;
     ESP_LOGI(BT_TAG, "Host task started");
@@ -404,6 +441,11 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
             g_ble_last_tick_slot = -1;
             g_ble_last_tick_sec = -1;
             g_ble_text_mode = false;
+            g_ble_tx_notify_enabled = false;
+            g_ble_tx_indicate_enabled = false;
+            g_ble_indicate_waiting = false;
+            g_ble_indicate_status = 0;
+            g_ble_att_mtu = 23;
             ESP_LOGI(BT_TAG, "Connected, handle=%u", g_conn_handle);
         } else {
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -418,9 +460,45 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
         g_ble_last_tick_slot = -1;
         g_ble_last_tick_sec = -1;
         g_ble_text_mode = false;
+        g_ble_tx_notify_enabled = false;
+        g_ble_tx_indicate_enabled = false;
+        g_ble_indicate_waiting = false;
+        g_ble_indicate_status = 0;
+        g_ble_att_mtu = 23;
         if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
         ESP_LOGW(BT_TAG, "Disconnected; restarting adv");
         ble_app_advertise();
+        break;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.conn_handle == g_conn_handle &&
+            event->subscribe.attr_handle == gatt_tx_handle) {
+            g_ble_tx_notify_enabled = event->subscribe.cur_notify != 0;
+            g_ble_tx_indicate_enabled = event->subscribe.cur_indicate != 0;
+            ESP_LOGI(BT_TAG, "TX subscribe: notify=%d indicate=%d",
+                     g_ble_tx_notify_enabled ? 1 : 0,
+                     g_ble_tx_indicate_enabled ? 1 : 0);
+        }
+        break;
+
+    case BLE_GAP_EVENT_NOTIFY_TX:
+        if (event->notify_tx.conn_handle == g_conn_handle &&
+            event->notify_tx.attr_handle == gatt_tx_handle &&
+            event->notify_tx.indication &&
+            g_ble_indicate_waiting) {
+            const int st = event->notify_tx.status;
+            if (st != 0) {
+                g_ble_indicate_status = st;
+                g_ble_indicate_waiting = false;
+            }
+        }
+        break;
+
+    case BLE_GAP_EVENT_MTU:
+        if (event->mtu.conn_handle == g_conn_handle && event->mtu.value > 0) {
+            g_ble_att_mtu = event->mtu.value;
+            ESP_LOGI(BT_TAG, "ATT MTU=%u", (unsigned)g_ble_att_mtu);
+        }
         break;
 
     default:
@@ -546,23 +624,6 @@ static esp_err_t ensure_sdcard_mounted() {
   return ESP_FAIL;
 }
 
-static bool ends_with_adi(const char* name) {
-  size_t n = strlen(name);
-  return (n >= 4) && (strcasecmp(name + (n - 4), ".adi") == 0);
-}
-
-static bool is_rxtx_log_name(const char* name) {
-  if (!name) return false;
-  // Match RT[YYMMDD].log -> total length 12
-  // Example: RT260319.log
-  if (strlen(name) != 12) return false;
-  if (name[0] != 'R' || name[1] != 'T') return false;
-  for (int i = 2; i < 8; ++i) {
-    if (name[i] < '0' || name[i] > '9') return false;
-  }
-  return strcmp(name + 8, ".log") == 0;
-}
-
 static void build_rxtx_log_path(char* path, size_t path_sz) {
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
@@ -573,14 +634,6 @@ static void build_rxtx_log_path(char* path, size_t path_sz) {
            (t.tm_year + 1900) % 100,
            (t.tm_mon + 1) % 100,
            t.tm_mday % 100);
-}
-
-static bool is_log_file_on_spiffs(const char* name) {
-  if (!name) return false;
-  if (ends_with_adi(name)) return true;
-  return is_rxtx_log_name(name) ||
-         (strcmp(name, "Station.ini") == 0) ||
-         (strcmp(name, "fieldday.log") == 0);
 }
 
 static bool file_exists(const char* path) {
@@ -649,8 +702,7 @@ static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path)
   return ESP_OK;
 }
 
-// Copy all log files from SPIFFS -> SD card, overwriting destination.
-// Copies: *.adi, RT[YYMMDD].log, Station.ini
+// Copy all regular files from SPIFFS -> SD card, overwriting destination.
 static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
   esp_err_t mret = ensure_sdcard_mounted();
   if (mret != ESP_OK) return mret;
@@ -668,17 +720,17 @@ static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
   while ((ent = readdir(d)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-    if (!is_log_file_on_spiffs(name)) continue;
 
     std::string src = std::string("/spiffs/") + name;
 
     struct stat st;
-    bool ok = false;
+    bool stat_ok = false;
     for (int i = 0; i < 5; ++i) {
-      if (stat(src.c_str(), &st) == 0 && S_ISREG(st.st_mode)) { ok = true; break; }
+      if (stat(src.c_str(), &st) == 0) { stat_ok = true; break; }
       vTaskDelay(pdMS_TO_TICKS(50));
     }
-    if (!ok) { last_err = ESP_FAIL; continue; }
+    if (!stat_ok) { last_err = ESP_FAIL; continue; }
+    if (!S_ISREG(st.st_mode)) continue;
 
     std::string dst = std::string("/sdcard/") + name;
     esp_err_t err = copy_file_overwrite(src.c_str(), dst.c_str());
@@ -689,9 +741,7 @@ static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
   unmount_sd_spi("/sdcard");
   return last_err;
 }
-// Delete log files on SPIFFS (keep Station.ini).
-// Deletes: *.adi, RT[YYMMDD].log, fieldday.log
-
+// Delete all regular files on SPIFFS, except Station.ini.
 static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
   DIR* d = opendir("/spiffs");
   if (!d) return ESP_FAIL;
@@ -700,11 +750,11 @@ static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
   while ((ent = readdir(d)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-
-    if (ends_with_adi(name) || is_rxtx_log_name(name) || strcmp(name, "fieldday.log") == 0) {
-      std::string path = std::string("/spiffs/") + name;
-      unlink(path.c_str());  // ignore missing/err
-    }
+    if (strcmp(name, "Station.ini") == 0) continue;
+    std::string path = std::string("/spiffs/") + name;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    unlink(path.c_str());  // ignore missing/err
   }
   closedir(d);
   return ESP_OK;
@@ -1012,7 +1062,7 @@ static std::vector<std::string> g_ctrl_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "PaperFT8 V1.4.2",
+    "PaperFT8 V1.4.3",
     "S: Status(Operate)",
     "R: Rx page",
     "T: Tx page",
@@ -1193,6 +1243,7 @@ static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry sche
 [[maybe_unused]] static int g_sync_delta_ms = 0;
 static void enqueue_beacon_cq();
 static void qso_load_file_list();
+static void qso_load_fetch_file_list();
 static void qso_load_entries(const std::string& path);
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
@@ -1429,6 +1480,34 @@ static void qso_load_file_list() {
   std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
   if (g_q_files.empty()) {
     g_q_lines.push_back("No ADIF logs");
+    return;
+  }
+  for (size_t i = 0; i < g_q_files.size(); ++i) {
+    g_q_lines.push_back(g_q_files[i]);
+  }
+}
+
+static void qso_load_fetch_file_list() {
+  g_q_files.clear();
+  g_q_lines.clear();
+  DIR* dir = opendir("/spiffs");
+  if (!dir) {
+    g_q_lines.push_back("No SPIFFS files");
+    return;
+  }
+  struct dirent* ent;
+  while ((ent = readdir(dir)) != nullptr) {
+    const char* name = ent->d_name;
+    if (!name || name[0] == '.') continue;
+    std::string path = std::string("/spiffs/") + name;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    g_q_files.emplace_back(name);
+  }
+  closedir(dir);
+  std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
+  if (g_q_files.empty()) {
+    g_q_lines.push_back("No SPIFFS files");
     return;
   }
   for (size_t i = 0; i < g_q_files.size(); ++i) {
@@ -2235,6 +2314,7 @@ static bool is_startup_direct_mode_key(char c) {
     case 'Q':
     case 'M':
     case 'B':
+    case 'F':
     case 'C':
     case 'D':
       return true;
@@ -3672,17 +3752,108 @@ static int page_count(int items, int page_size) {
   return (items + page_size - 1) / page_size;
 }
 
-static void ble_notify_payload(const std::string& payload) {
-  if (!g_ble_stack_active) return;
-  if (!g_ble_enabled) return;
-  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-  if (!gatt_tx_handle) return;
+static int ble_send_payload_raw(const std::string& payload, bool indicate) {
+  if (!g_ble_stack_active) return BLE_HS_EINVAL;
+  if (!g_ble_enabled) return BLE_HS_EINVAL;
+  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return BLE_HS_ENOTCONN;
+  if (!gatt_tx_handle) return BLE_HS_EINVAL;
   struct os_mbuf* om = ble_hs_mbuf_from_flat(payload.data(), payload.size());
-  if (!om) return;
-  int rc = ble_gatts_notify_custom(g_conn_handle, gatt_tx_handle, om);
+  if (!om) return BLE_HS_ENOMEM;
+  int rc = indicate
+             ? ble_gatts_indicate_custom(g_conn_handle, gatt_tx_handle, om)
+             : ble_gatts_notify_custom(g_conn_handle, gatt_tx_handle, om);
   if (rc != 0) {
-    ESP_LOGD(BT_TAG, "notify failed rc=%d", rc);
+    ESP_LOGD(BT_TAG, "%s failed rc=%d", indicate ? "indicate" : "notify", rc);
   }
+  return rc;
+}
+
+static void ble_notify_payload(const std::string& payload) {
+  (void)ble_send_payload_raw(payload, false);
+}
+
+static bool ble_wait_for_indicate_ack(int timeout_ms) {
+  const int step_ms = 10;
+  int waited = 0;
+  while (g_ble_indicate_waiting && waited < timeout_ms) {
+    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+      g_ble_indicate_status = BLE_HS_ENOTCONN;
+      g_ble_indicate_waiting = false;
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(step_ms));
+    waited += step_ms;
+  }
+  if (g_ble_indicate_waiting) {
+    g_ble_indicate_status = BLE_HS_ETIMEOUT;
+    g_ble_indicate_waiting = false;
+  }
+  return g_ble_indicate_status == BLE_HS_EDONE;
+}
+
+static void ble_dump_reset_transfer_state(bool use_indicate) {
+  g_ble_dump_xfer = BleDumpTransferState{};
+  g_ble_dump_xfer.active = true;
+  g_ble_dump_xfer.mode = use_indicate ? BleDumpTxMode::Indicate : BleDumpTxMode::Notify;
+  g_ble_dump_xfer.notify_pace_ms = kBleDumpNotifyPaceMinMs;
+  g_ble_dump_xfer.mtu = g_ble_att_mtu;
+  g_ble_indicate_waiting = false;
+  g_ble_indicate_status = 0;
+}
+
+static bool ble_dump_send_line(const std::string& raw) {
+  std::string line = raw;
+  while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+    line.pop_back();
+  }
+  std::string payload = line + "\n";
+
+  if (g_ble_dump_xfer.mode == BleDumpTxMode::Indicate) {
+    for (int attempt = 0; attempt <= kBleDumpIndicateMaxRetries; ++attempt) {
+      g_ble_indicate_status = 0;
+      g_ble_indicate_waiting = true;
+      const int rc = ble_send_payload_raw(payload, true);
+      if (rc == 0) {
+        if (ble_wait_for_indicate_ack(kBleDumpIndicateAckTimeoutMs)) {
+          return true;
+        }
+      } else {
+        g_ble_indicate_waiting = false;
+        g_ble_indicate_status = rc;
+      }
+      if (attempt < kBleDumpIndicateMaxRetries) {
+        g_ble_dump_xfer.retries++;
+        const int bi = attempt < kBleDumpNotifyMaxRetries ? attempt : (kBleDumpNotifyMaxRetries - 1);
+        vTaskDelay(pdMS_TO_TICKS(kBleDumpNotifyBackoffMs[bi]));
+      }
+    }
+    g_ble_dump_xfer.failed_lines++;
+    return false;
+  }
+
+  int attempt = 0;
+  for (; attempt <= kBleDumpNotifyMaxRetries; ++attempt) {
+    const int rc = ble_send_payload_raw(payload, false);
+    if (rc == 0) break;
+    if (attempt < kBleDumpNotifyMaxRetries) {
+      g_ble_dump_xfer.retries++;
+      vTaskDelay(pdMS_TO_TICKS(kBleDumpNotifyBackoffMs[attempt]));
+    }
+  }
+  if (attempt > kBleDumpNotifyMaxRetries) {
+    g_ble_dump_xfer.failed_lines++;
+    return false;
+  }
+
+  if (attempt > 0) {
+    int next_pace = g_ble_dump_xfer.notify_pace_ms + (attempt * 2);
+    if (next_pace > kBleDumpNotifyPaceMaxMs) next_pace = kBleDumpNotifyPaceMaxMs;
+    g_ble_dump_xfer.notify_pace_ms = next_pace;
+  } else if (g_ble_dump_xfer.notify_pace_ms > kBleDumpNotifyPaceMinMs) {
+    g_ble_dump_xfer.notify_pace_ms--;
+  }
+  vTaskDelay(pdMS_TO_TICKS(g_ble_dump_xfer.notify_pace_ms));
+  return true;
 }
 
 static void apply_ble_enabled_policy(bool runtime_apply) {
@@ -3888,7 +4059,6 @@ static void ble_start_qso_pick_mode() {
   g_ble_dump_in_progress = false;
   g_q_show_entries = false;
   q_page = 0;
-  qso_load_file_list();
   enter_mode(UIMode::QSO);
   ui_draw_list(g_q_lines, q_page, -1);
   g_ble_force_send = true;
@@ -3905,26 +4075,44 @@ static void ble_cancel_qso_pick_mode() {
 
 static void ble_dump_qso_file(const std::string& file_name) {
   g_ble_dump_in_progress = true;
+  const bool use_indicate = g_ble_tx_indicate_enabled;
+  ble_dump_reset_transfer_state(use_indicate);
   std::string full_path = std::string("/spiffs/") + file_name;
-  ble_notify_line(std::string("\n--- <") + file_name + "> ---");
+  if (!use_indicate) {
+    (void)ble_dump_send_line("fallback notify mode (best effort)");
+  }
+  (void)ble_dump_send_line(std::string("\n--- <") + file_name + "> ---");
 
   FILE* f = fopen(full_path.c_str(), "r");
   if (!f) {
-    ble_notify_line("Open fail");
+    (void)ble_dump_send_line("Open fail");
   } else {
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-      ble_notify_line(line);
-      vTaskDelay(pdMS_TO_TICKS(1));
+      g_ble_dump_xfer.file_lines++;
+      (void)ble_dump_send_line(line);
     }
     fclose(f);
   }
-  ble_notify_line("--- EOF ---");
+  (void)ble_dump_send_line("--- EOF ---");
+  {
+    char summary[160];
+    std::snprintf(summary, sizeof(summary),
+                  "F summary mode=%s mtu=%u lines=%d retries=%d failed=%d",
+                  use_indicate ? "INDICATE" : "NOTIFY",
+                  (unsigned)g_ble_dump_xfer.mtu,
+                  g_ble_dump_xfer.file_lines,
+                  g_ble_dump_xfer.retries,
+                  g_ble_dump_xfer.failed_lines);
+    (void)ble_dump_send_line(summary);
+  }
 
   g_ble_dump_in_progress = false;
-  g_ble_qso_pick_mode = false;
-  if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
-  enter_mode(g_ble_qso_return_mode);
+  g_ble_indicate_waiting = false;
+  g_ble_dump_xfer.active = false;
+  if (ui_mode == UIMode::QSO) {
+    ui_draw_list(g_q_lines, q_page, -1);
+  }
   g_ble_force_send = true;
 }
 
@@ -4614,7 +4802,11 @@ static void enter_mode(UIMode new_mode) {
       ui_draw_mode_box("Q");
       g_q_show_entries = false;
       q_page = 0;
-      qso_load_file_list();
+      if (g_ble_qso_pick_mode) {
+        qso_load_fetch_file_list();
+      } else {
+        qso_load_file_list();
+      }
       ui_draw_list(g_q_lines, q_page, -1);
       break;
     case UIMode::STATUS:
@@ -4973,7 +5165,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       continue;
     }
     last_key = c;
-    if (c == 'c' || c == 'C') {
+    if ((c == 'c' || c == 'C') && !c_from_ble) {
       enter_mode(UIMode::RX);
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -5138,12 +5330,16 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         switched = true;
       }
+      else if ((c == 'f' || c == 'F') && c_from_ble) {
+        cancel_status_edit();
+        ble_start_qso_pick_mode();
+        switched = true;
+      }
       else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
       else if (c == 'c' || c == 'C') {
 #if ENABLE_BLE
         if (c_from_ble) {
-          cancel_status_edit();
-          ble_start_qso_pick_mode();
+          // BLE 'C' is intentionally ignored.
           switched = true;
         } else
 #endif
@@ -5701,7 +5897,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 menu_flash_idx = 16; // abs index of page 2 line 5
                 menu_flash_deadline = rtc_now_ms() + 500;
                 if (err == ESP_OK) {
-                  debug_log_line("Copied logs to SD");
+                  debug_log_line("Copied SPIFFS files to SD");
                 } else {
                   //char buf[64];
                   //snprintf(buf, sizeof(buf), "f:%x %s", (unsigned)err, esp_err_to_name(err));
