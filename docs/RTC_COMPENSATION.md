@@ -15,7 +15,7 @@ Implement a compensation mechanism that:
 
 ## Data Model
 
-Two new fields in station data (`StationData.ini`):
+Two new fields in station data (`Station.txt`):
 
 ```
 rtc_sleep_epoch=1735689600    # Unix epoch when entering deep sleep

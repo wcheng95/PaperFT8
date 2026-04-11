@@ -55,7 +55,7 @@ extern "C" {
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
 
-static const char* STATION_FILE = "/spiffs/Station.ini";
+static const char* STATION_FILE = "/spiffs/Station.txt";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
 static bool g_ble_enabled = true;
@@ -629,8 +629,8 @@ static void build_rxtx_log_path(char* path, size_t path_sz) {
   struct tm t;
   localtime_r(&now, &t);
 
-  // RT[YYMMDD].log
-  snprintf(path, path_sz, "/spiffs/RT%02d%02d%02d.log",
+  // RT[YYMMDD].txt
+  snprintf(path, path_sz, "/spiffs/RT%02d%02d%02d.txt",
            (t.tm_year + 1900) % 100,
            (t.tm_mon + 1) % 100,
            t.tm_mday % 100);
@@ -641,27 +641,27 @@ static bool file_exists(const char* path) {
   return (stat(path, &st) == 0) && S_ISREG(st.st_mode);
 }
 
-static void sync_station_ini_from_sd_to_spiffs() {
+static void sync_station_txt_from_sd_to_spiffs() {
   static const char* TAG = "FT8";
 
   if (ensure_sdcard_mounted() != ESP_OK) {
-    ESP_LOGI(TAG, "SD not mounted, using SPIFFS Station.ini");
+    ESP_LOGI(TAG, "SD not mounted, using SPIFFS Station.txt");
     return;
   }
 
-  const char* sd_path = "/sdcard/Station.ini";
-  const char* spiffs_path = "/spiffs/Station.ini";
+  const char* sd_path = "/sdcard/Station.txt";
+  const char* spiffs_path = "/spiffs/Station.txt";
 
   if (!file_exists(sd_path)) {
-    ESP_LOGI(TAG, "No Station.ini on SD, using SPIFFS Station.ini");
+    ESP_LOGI(TAG, "No Station.txt on SD, using SPIFFS Station.txt");
     unmount_sd_spi("/sdcard");
     return;
   }
 
   if (copy_file_overwrite(sd_path, spiffs_path) == ESP_OK) {
-    ESP_LOGI(TAG, "Copied Station.ini from SD to SPIFFS");
+    ESP_LOGI(TAG, "Copied Station.txt from SD to SPIFFS");
   } else {
-    ESP_LOGW(TAG, "Failed to copy Station.ini from SD, using SPIFFS Station.ini");
+    ESP_LOGW(TAG, "Failed to copy Station.txt from SD, using SPIFFS Station.txt");
   }
 
   unmount_sd_spi("/sdcard");
@@ -741,7 +741,7 @@ static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
   unmount_sd_spi("/sdcard");
   return last_err;
 }
-// Delete all regular files on SPIFFS, except Station.ini.
+// Delete all regular files on SPIFFS, except Station.txt.
 static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
   DIR* d = opendir("/spiffs");
   if (!d) return ESP_FAIL;
@@ -750,7 +750,7 @@ static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
   while ((ent = readdir(d)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-    if (strcmp(name, "Station.ini") == 0) continue;
+    if (strcmp(name, "Station.txt") == 0) continue;
     std::string path = std::string("/spiffs/") + name;
     struct stat st;
     if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
@@ -1439,7 +1439,7 @@ static void log_cabrillo_fd_entry(const std::string& dxcall, const std::string& 
   // Frequency: use selected band dial frequency (kHz)
   int freq_khz = (int)g_bands[g_band_sel].freq;
 
-  const char* path = "/spiffs/fieldday.log";
+  const char* path = "/spiffs/fieldday.txt";
 
   std::string location = fd_get_section_from_exchange(my_fd);
   cabrillo_fd_ensure_header(path, g_call, location);
@@ -1504,26 +1504,34 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
   xSemaphoreGive(log_mutex);
 }
 
+static bool is_daily_qso_txt_file(const char* name) {
+  if (!name) return false;
+  if (strlen(name) != 12) return false;  // YYYYMMDD.txt
+  for (int i = 0; i < 8; ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
+  }
+  return std::strcmp(name + 8, ".txt") == 0;
+}
+
 static void qso_load_file_list() {
   g_q_files.clear();
   g_q_lines.clear();
   DIR* dir = opendir("/spiffs");
   if (!dir) {
-    g_q_lines.push_back("No ADIF logs");
+    g_q_lines.push_back("No QSO logs");
     return;
   }
   struct dirent* ent;
   while ((ent = readdir(dir)) != nullptr) {
     const char* name = ent->d_name;
-    size_t len = strlen(name);
-    if (len >= 4 && strcasecmp(name + len - 4, ".adi") == 0) {
+    if (is_daily_qso_txt_file(name)) {
       g_q_files.emplace_back(name);
     }
   }
   closedir(dir);
   std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
   if (g_q_files.empty()) {
-    g_q_lines.push_back("No ADIF logs");
+    g_q_lines.push_back("No QSO logs");
     return;
   }
   for (size_t i = 0; i < g_q_files.size(); ++i) {
@@ -1677,7 +1685,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   int day = t.tm_mday;
   snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
   char path[64];
-  snprintf(path, sizeof(path), "/spiffs/%s.adi", date);
+  snprintf(path, sizeof(path), "/spiffs/%s.txt", date);
 
   bool need_header = false;
   struct stat st;
@@ -4669,9 +4677,8 @@ static void poll_host_uart() {
 }
 
 static void load_station_data() {
-  // If Station.ini exists on SD, prefer it by copying onto SPIFFS first.
-  // If mount/copy fails, fall back to the on-device SPIFFS Station.ini.
-  sync_station_ini_from_sd_to_spiffs();
+  // Sync only Station.txt from SD to SPIFFS (no legacy fallback).
+  sync_station_txt_from_sd_to_spiffs();
 
   g_rtc_comp = 0;
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;

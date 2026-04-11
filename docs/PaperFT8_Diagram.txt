@@ -1,4 +1,4 @@
-Mini-FT8 main program (high-level text diagram)
+PaperFT8 main program (high-level text diagram)
 
 +-----------------------------------------------------------------------------------+
 |                                   app_main()                                      |
@@ -17,7 +17,7 @@ Mini-FT8 main program (high-level text diagram)
 |   - init_soft_uart()    (optional debug UART on GPIO1/2)                           |
 |   - ui_init(); ui_draw_rx()                                                        |
 |   - autoseq_init(); autoseq_set_adif_callback(log_adif_entry)                      |
-|   - load_station_data(): read /spiffs/StationData.ini                              |
+|   - load_station_data(): read /spiffs/Station.txt                                  |
 |        * bands, offsets, call/grid, comments, active bands, rtc_comp, etc          |
 |        * rtc_init_from_hw() else rtc_set_from_strings()                            |
 |        * rebuild_active_bands()                                                    |
@@ -138,7 +138,7 @@ Key runtime subsystems & dataflow
     MENU   -> draw_menu_view() (+ long-edit support)
     HOST   -> uac_start(); show status lines (updates every 500ms)
     CONTROL-> show cmd help + start USB prompt
-    QSO    -> list *.adi files -> entries in file
+    QSO    -> list YYYYMMDD.txt files -> entries in file
     STATUS -> beacon/temp edits + date/time edits
     DEBUG/LIST -> paged list display
 
@@ -172,15 +172,15 @@ Key runtime subsystems & dataflow
 
 (4) Persistence & logs (SPIFFS)
 
-  StationData.ini
+  Station.txt
     - bands, band_sel, offset, offset_src, radio, call/grid, ant, comment1,
       active_bands, skiptx1, rxtx_log, rtc_sleep_epoch, rtc_comp, date/time
 
-  RxTxLog.txt
+  RTYYMMDD.txt
     - 'R' lines: timestamp, freq, text, snr, offset
     - 'T' lines: timestamp, freq, text, offset
 
-  YYYYMMDD.adi
+  YYYYMMDD.txt
     - ADIF entries appended via log_adif_entry() callback from autoseq
 
 
