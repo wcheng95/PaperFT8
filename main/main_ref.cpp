@@ -5260,8 +5260,47 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       continue;
     }
     last_key = c;
-    if ((c == 'c' || c == 'C') && !c_from_ble) {
-      enter_mode(UIMode::RX);
+    if (!c_from_ble) {
+      char mode_key = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      switch (mode_key) {
+        case 'R':
+          enter_mode(UIMode::RX);
+          break;
+        case 'T':
+          enter_mode(UIMode::TX);
+          break;
+        case 'B':
+          enter_mode(UIMode::BAND);
+          break;
+        case 'Q':
+          enter_mode(UIMode::QSO);
+          break;
+        case 'D':
+          enter_mode(UIMode::DEBUG);
+          break;
+        case 'S':
+          enter_mode(UIMode::STATUS);
+          break;
+        case 'M':
+          enter_mode(UIMode::MENU);
+          break;
+        case 'N':
+          enter_mode(UIMode::MENU);
+          if (menu_page < 2) menu_page++;
+          draw_menu_view();
+          break;
+        case 'O':
+          enter_mode(UIMode::MENU);
+          if (menu_page < 2) menu_page++;
+          if (menu_page < 2) menu_page++;
+          draw_menu_view();
+          break;
+        case 'C':
+          enter_mode(UIMode::RX);
+          break;
+        default:
+          break;
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
     continue;
