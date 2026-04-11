@@ -1063,11 +1063,11 @@ static std::vector<std::string> g_ctrl_lines = {
 
 static std::vector<std::string> g_startup_lines = {
     "PaperFT8 V1.4.3",
-    "S: Status(Operate)",
-    "R: Rx page",
-    "T: Tx page",
-    "M: Menu(Setting)",
-    "Other: Q/C/B/N/O/D"
+    "Command: Status Rx",
+    "Tx Qso Menu(N,O)", 
+    "Band Delete",
+    "BLE: Fetch U-up V-",
+    "down Z-left X-right"
 };
 
 // Runtime latch: when true, we keep showing the startup screen until any key is pressed.
@@ -1289,6 +1289,7 @@ static void qso_load_file_list();
 static void qso_load_fetch_file_list();
 static void delete_load_file_list();
 static void qso_load_entries(const std::string& path);
+static void qso_draw_page();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
 static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
@@ -1560,6 +1561,7 @@ static void delete_load_file_list() {
   g_d_files.clear();
   g_d_lines.clear();
   load_spiffs_regular_files(g_d_files);
+  g_d_files.erase(std::remove(g_d_files.begin(), g_d_files.end(), "Station.txt"), g_d_files.end());
   if (g_d_files.empty()) {
     g_d_lines.push_back("No SPIFFS files");
     return;
@@ -1663,6 +1665,14 @@ static void qso_load_entries(const std::string& path) {
   }
   fclose(f);
   if (g_q_lines.empty()) g_q_lines.push_back("No QSOs");
+}
+
+static void qso_draw_page() {
+  if (g_q_show_entries) {
+    ui_draw_debug(g_q_lines, q_page);
+  } else {
+    ui_draw_list(g_q_lines, q_page, -1);
+  }
 }
 
 static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
@@ -2973,7 +2983,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     if (lines[line - 1].size() < 20) lines[line - 1].push_back('_');
     else if (line < 6) lines[line] = "_";
   }
-  ui_draw_list(lines, 0, -1);
+  ui_draw_debug(lines, 0);
 }
 
 static bool touch_keyboard_active() {
@@ -3740,8 +3750,8 @@ static void draw_menu_view() {
   } else {
     lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
   }
-  lines.push_back("Copy Logs to SD");
-  lines.push_back(menu_delete_confirm ? "Delete Logs? ^:Y v:N" : "Delete Logs");
+  lines.push_back("Copy Files to SD");
+  lines.push_back(menu_delete_confirm ? "Delete All Files? ^:Y v:N" : "Delete All Files");
 
   int highlight_abs = -1;
   int64_t now = rtc_now_ms();
@@ -4085,7 +4095,7 @@ static std::string ble_text_mode_line7() {
   std::string item = "Edit";
 
   if (menu_delete_confirm) {
-    item = "Delete Logs";
+    item = "Delete All Files";
   } else if (menu_long_edit) {
     item = ble_menu_long_edit_label();
   } else if (menu_edit_idx >= 0) {
@@ -4137,7 +4147,7 @@ static void ble_start_qso_pick_mode() {
   g_q_show_entries = false;
   q_page = 0;
   enter_mode(UIMode::QSO);
-  ui_draw_list(g_q_lines, q_page, -1);
+  qso_draw_page();
   g_ble_force_send = true;
 }
 
@@ -4188,7 +4198,7 @@ static void ble_dump_qso_file(const std::string& file_name) {
   g_ble_indicate_waiting = false;
   g_ble_dump_xfer.active = false;
   if (ui_mode == UIMode::QSO) {
-    ui_draw_list(g_q_lines, q_page, -1);
+    qso_draw_page();
   }
   g_ble_force_send = true;
 }
@@ -4871,7 +4881,7 @@ static void enter_mode(UIMode new_mode) {
     case UIMode::CONTROL:
       ui_set_active_mode_button('C');
       ui_draw_mode_box("S");
-      ui_draw_list(g_ctrl_lines, 0, -1);
+      ui_draw_debug(g_ctrl_lines, 0);
       host_input.clear();
       ensure_usb();
       if (usb_ready) {
@@ -4891,7 +4901,7 @@ static void enter_mode(UIMode new_mode) {
       } else {
         qso_load_file_list();
       }
-      ui_draw_list(g_q_lines, q_page, -1);
+      qso_draw_page();
       break;
     case UIMode::STATUS:
       ui_set_active_mode_button('S');
@@ -5104,7 +5114,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   ui_set_active_mode_button('R');
 
   if (g_startup_active) {
-    ui_draw_list(g_startup_lines, 0, -1);
+    ui_draw_debug(g_startup_lines, 0);
   } else {
     ui_force_redraw_rx();
     ui_draw_rx();
@@ -5708,9 +5718,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 #if ENABLE_BLE
           if (g_ble_qso_pick_mode && c_from_ble) {
             if (c == ';') {
-              if (q_page > 0) { q_page--; ui_draw_list(g_q_lines, q_page, -1); }
+              if (q_page > 0) { q_page--; qso_draw_page(); }
             } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; ui_draw_list(g_q_lines, q_page, -1); }
+              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
             } else if (c >= '1' && c <= '6') {
               ble_try_dump_qso_file_by_key(c);
             } else if (c == '`') {
@@ -5721,9 +5731,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 #endif
           if (!g_q_show_entries) {
             if (c == ';') {
-              if (q_page > 0) { q_page--; ui_draw_list(g_q_lines, q_page, -1); }
+              if (q_page > 0) { q_page--; qso_draw_page(); }
             } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; ui_draw_list(g_q_lines, q_page, -1); }
+              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
             } else if (c >= '1' && c <= '6') {
               int idx = q_page * 6 + (c - '1');
               if (idx >= 0 && idx < (int)g_q_files.size()) {
@@ -5731,20 +5741,20 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 qso_load_entries(g_q_current_file);
                 g_q_show_entries = true;
                 q_page = 0;
-                ui_draw_list(g_q_lines, q_page, -1);
+                qso_draw_page();
               }
             }
           } else {
             if (c == ';') {
-              if (q_page > 0) { q_page--; ui_draw_list(g_q_lines, q_page, -1); }
+              if (q_page > 0) { q_page--; qso_draw_page(); }
             } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; ui_draw_list(g_q_lines, q_page, -1); }
+              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
             } else if (c == '`') {
               // back to file list
               g_q_show_entries = false;
               q_page = 0;
               qso_load_file_list();
-              ui_draw_list(g_q_lines, q_page, -1);
+              qso_draw_page();
             }
           }
           break;
