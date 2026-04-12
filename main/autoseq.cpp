@@ -304,7 +304,7 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
             break;
         case AutoseqState::SIGNOFF:
             // After TX5:
-            // - First pass: park in inactive so late RR73 can be answered.
+            // - First pass: park in inactive so late RR73 can be answered once.
             // - Late-ack pass: finish immediately.
             if (ctx->park_after_signoff_tx) {
                 move_to_inactive(0);
@@ -727,9 +727,32 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         }
     }
 
-    // State machine transitions
+    // State machine transitions.
+    //
+    // INVARIANT: Every active ctx with state != IDLE must have next_tx != TX_UNDEF.
+    // Each state handler explicitly handles every rcvd type. The "no-op" default
+    // case (DX sent something that doesn't advance our state) refreshes next_tx
+    // to the canonical value for the current state — i.e. "keep sending what we
+    // were sending before." This makes generate_response a total function over
+    // (state, rcvd) and repairs the invariant even if a caller (like reactivate)
+    // passes in a ctx with a stale TX_UNDEF.
     switch (ctx->state) {
         case AutoseqState::CALLING:  // We sent CQ
+            // CQ is short-lived by design: autoseq_start_cq sets next_tx=TX6,
+            // we TX once, and tick() transitions CALLING→IDLE→pop. The beacon
+            // re-enqueues a fresh CQ on the next cycle if still on.
+            //
+            // The default case here is unreachable in normal operation:
+            //  - CALLING ctx always has dxcall="CQ" which never matches a DX
+            //    sender, so on_decode never calls generate_response(false) on
+            //    an existing CALLING ctx.
+            //  - The override path sets CALLING only when rcvd=TX1, which
+            //    immediately transitions via the TX1 case below.
+            //  - CALLING ctxs never enter the inactive zone (tick pops them
+            //    directly), so reactivation never produces CALLING.
+            // Therefore no next_tx refresh is needed — the invariant is
+            // maintained by construction. Refreshing to TX6 would wrongly
+            // re-send CQ and violate the short-lived design.
             switch (rcvd) {
                 case TxMsgType::TX1:
                     set_state(ctx, AutoseqState::REPORT, TxMsgType::TX2, s_max_retry);
@@ -745,7 +768,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     return false;
             }
 
-        case AutoseqState::REPLYING:  // We sent TX1
+        case AutoseqState::REPLYING:  // We sent TX1 (grid)
             switch (rcvd) {
                 case TxMsgType::TX2:
                     set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX3, s_max_retry);
@@ -761,10 +784,12 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     log_qso_if_needed(ctx);
                     return true;
                 default:
+                    // No-op (e.g. DX resent TX1): keep sending our grid
+                    ctx->next_tx = TxMsgType::TX1;
                     return false;
             }
 
-        case AutoseqState::REPORT:  // We sent TX2
+        case AutoseqState::REPORT:  // We sent TX2 (report)
             switch (rcvd) {
                 case TxMsgType::TX2:
                     // DX sent their own report (no R prefix) — they either
@@ -783,10 +808,12 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     log_qso_if_needed(ctx);
                     return true;
                 default:
+                    // No-op (e.g. DX resent TX1 grid): keep sending our report
+                    ctx->next_tx = TxMsgType::TX2;
                     return false;
             }
 
-        case AutoseqState::ROGER_REPORT:  // We sent TX3
+        case AutoseqState::ROGER_REPORT:  // We sent TX3 (R+report)
             switch (rcvd) {
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
@@ -795,10 +822,12 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     log_qso_if_needed(ctx);
                     return true;
                 default:
+                    // No-op (DX resent TX1/TX2/TX3): keep sending R+report
+                    ctx->next_tx = TxMsgType::TX3;
                     return false;
             }
 
-        case AutoseqState::ROGERS:  // We sent TX4
+        case AutoseqState::ROGERS:  // We sent TX4 (RR73)
             switch (rcvd) {
                 case TxMsgType::TX3:
                     // DX didn't get our RR73 — re-send with fresh retries.
@@ -809,13 +838,14 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                 case TxMsgType::TX5:
                     // Already logged at ROGERS entry - just mark complete
                     set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_UNDEF, 0);
-                    break;
+                    return false;
                 default:
-                    break;
+                    // No-op (DX resent TX1/TX2): keep sending RR73
+                    ctx->next_tx = TxMsgType::TX4;
+                    return false;
             }
-            return false;
 
-        case AutoseqState::SIGNOFF:  // We sent TX5
+        case AutoseqState::SIGNOFF:  // We sent TX5 (73)
             switch (rcvd) {
                 case TxMsgType::TX4:
                     // Late RR73: send another 73 and park inactive again.
@@ -828,9 +858,10 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     ctx->park_after_signoff_tx = false;
                     return false;
                 default:
+                    // No-op (DX resent earlier message): keep sending 73
+                    ctx->next_tx = TxMsgType::TX5;
                     return false;
             }
-            return false;
 
         default:
             break;
