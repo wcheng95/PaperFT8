@@ -28,12 +28,19 @@ struct TouchEvent {
     int   message_index  = 0;
 };
 
+struct FreeTextEvent {
+    float       time_offset = 0.0f;
+    std::string text;
+};
+
 struct TestPeriod {
     std::vector<UiRxLine> messages;     // RX messages for this period
     bool         has_beacon_change = false;
     BeaconChange beacon_change;
     bool         has_touch_event = false;
     TouchEvent   touch_event;
+    bool          has_freetext_event = false;
+    FreeTextEvent freetext_event;
 };
 
 struct TestData {

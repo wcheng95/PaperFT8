@@ -1026,6 +1026,8 @@ static void save_station_data();
 // TX entry for display and scheduling (populated by autoseq)
 static AutoseqTxEntry g_pending_tx;
 static bool g_pending_tx_valid = false;
+static bool g_deferred_freetext_valid = false;
+static std::string g_deferred_freetext_text;
 static volatile bool g_tx_cancel_requested = false;
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
@@ -2258,6 +2260,7 @@ static void update_countdown() {
 // Forward declarations for single-threaded TX state machine
 static void tx_start(int skip_tones);
 static void tx_tick();
+static bool queue_freetext_autoseq(const std::string& text);
 
 // Slot boundary check - called from main loop
 // Matches reference project: tick after TX slot ends, TX trigger at slot start
@@ -2280,6 +2283,15 @@ static void check_slot_boundary() {
     autoseq_tick(slot_idx, slot_parity, 0);
     g_was_txing = false;
     g_tx_view_dirty = true;
+  }
+
+  if (!g_tx_active && !g_was_txing && g_deferred_freetext_valid) {
+    std::string text = g_deferred_freetext_text;
+    g_deferred_freetext_valid = false;
+    g_deferred_freetext_text.clear();
+    if (queue_freetext_autoseq(text)) {
+      debug_log_line(std::string("Queued: ") + text);
+    }
   }
 
   // TX trigger: check if we should start TX in this slot
@@ -3514,32 +3526,23 @@ static void enqueue_beacon_cq() {
   g_tx_view_dirty = true;
 }
 
-static bool autoseq_has_pending_tx() {
-  AutoseqTxEntry tmp;
-  return autoseq_fetch_pending_tx(tmp);
-}
-
-// Schedule a one-off pending TX (e.g., manual FreeText) without touching autoseq state.
-// Returns false if TX is already active or if scheduling failed.
-// Uses the single-threaded state machine - TX will trigger at next matching slot boundary.
-static bool schedule_manual_pending_tx(const AutoseqTxEntry& pending) {
-  // Already transmitting or TX pending?
-  if (g_tx_active || g_qso_xmit) {
+static bool queue_freetext_autoseq(const std::string& text) {
+  int64_t now_slot = rtc_now_ms() / 15000;
+  int fallback_parity = (int)((now_slot + 1) & 1);
+  if (!autoseq_schedule_freetext(text, fallback_parity)) {
     return false;
   }
 
-  int target_parity = pending.slot_id & 1;
+  AutoseqTxEntry pending;
+  if (!autoseq_fetch_pending_tx(pending)) {
+    return false;
+  }
 
-  // Set up pending TX
+  g_qso_xmit = true;
   g_pending_tx = pending;
   g_pending_tx_valid = true;
-
-  // Set flags for check_slot_boundary() to trigger TX
-  g_qso_xmit = true;
-  g_target_slot_parity = target_parity;
-
-  ESP_LOGI(TAG, "schedule_manual_pending_tx: queued TX=%s for parity=%d",
-           pending.text.c_str(), target_parity);
+  g_target_slot_parity = pending.slot_id & 1;
+  g_tx_view_dirty = true;
   return true;
 }
 
@@ -5920,23 +5923,18 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 update_autoseq_cq_type();
                 draw_menu_view();
               } else if (c == '2') {
-                // Send freetext - one-off transmission, bypass autoseq
-                // If autoseq already has pending TX, ignore to avoid races
-                if (!autoseq_has_pending_tx()) {
-                  int64_t now_slot = rtc_now_ms() / 15000;
-                  AutoseqTxEntry ft{};
-                  ft.text = g_free_text;
-                  ft.dxcall = "FreeText";
-                  ft.offset_hz = g_offset_hz;
-                  ft.slot_id = (int)((now_slot + 1) & 1); // next slot
-                  ft.repeat_counter = 1;
-                  ft.is_signoff = false;
-                  if (schedule_manual_pending_tx(ft)) {
-                    menu_flash_idx = 1; // absolute index of "Send FreeText"
-                    menu_flash_deadline = rtc_now_ms() + 500;
-                    draw_menu_view();
-                    debug_log_line(std::string("Queued: ") + g_free_text);
-                  }
+                if (g_tx_active || g_was_txing) {
+                  g_deferred_freetext_text = g_free_text;
+                  g_deferred_freetext_valid = true;
+                  menu_flash_idx = 1; // absolute index of "Send FreeText"
+                  menu_flash_deadline = rtc_now_ms() + 500;
+                  draw_menu_view();
+                  debug_log_line(std::string("Queued after TX: ") + g_free_text);
+                } else if (queue_freetext_autoseq(g_free_text)) {
+                  menu_flash_idx = 1; // absolute index of "Send FreeText"
+                  menu_flash_deadline = rtc_now_ms() + 500;
+                  draw_menu_view();
+                  debug_log_line(std::string("Queued: ") + g_free_text);
                 }
               } else if (c == '3') {
                 menu_long_edit = true;

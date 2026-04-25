@@ -26,6 +26,10 @@ static QsoContext s_queue[AUTOSEQ_MAX_QUEUE];
 static int s_active_count = 0;
 static int s_inactive_start = AUTOSEQ_MAX_QUEUE;  // no inactive entries
 
+// Singleton sidecar for one-shot FreeText queue entries. Only one FreeText
+// entry is allowed active at a time, so per-context text storage is unnecessary.
+static std::string s_pending_ft_text;
+
 // Station configuration
 static std::string s_my_call;
 static std::string s_my_grid;
@@ -102,6 +106,7 @@ void autoseq_init() {
     s_pending_ctx_idx = -1;
     s_last_tx_slot_idx = -1000;
     s_last_tx_parity = -1;
+    s_pending_ft_text.clear();
 }
 
 void autoseq_clear() {
@@ -157,7 +162,7 @@ bool autoseq_rotate_same_parity() {
 void autoseq_start_cq(int slot_parity) {
     // Don't add duplicate CQ in active zone
     for (int i = 0; i < s_active_count; ++i) {
-        if (s_queue[i].state == AutoseqState::CALLING) {
+        if (s_queue[i].state == AutoseqState::CALLING && !s_queue[i].is_freetext) {
             return;
         }
     }
@@ -176,6 +181,40 @@ void autoseq_start_cq(int slot_parity) {
     set_state(ctx, AutoseqState::CALLING, TxMsgType::TX6, 0);
     // No sort needed - CQ always at bottom
     ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
+}
+
+bool autoseq_schedule_freetext(const std::string& text, int fallback_slot_parity) {
+    if (text.empty()) return false;
+
+    // Don't duplicate an already-pending FreeText one-shot.
+    for (int i = 0; i < s_active_count; ++i) {
+        if (s_queue[i].is_freetext) return false;
+    }
+
+    if (s_inactive_start <= s_active_count) {
+        evict_oldest_inactive();
+        if (s_inactive_start <= s_active_count) return false;
+    }
+
+    int slot_parity = (s_active_count > 0)
+                          ? (s_queue[0].slot_id & 1)
+                          : (fallback_slot_parity & 1);
+
+    s_pending_ft_text = text;
+
+    QsoContext* ctx = append_ctx();
+    if (!ctx) return false;
+    ctx->dxcall = "(FT)";
+    ctx->dxgrid.clear();
+    ctx->snr_tx = -99;
+    ctx->snr_rx = -99;
+    ctx->slot_id = slot_parity;
+    ctx->is_freetext = true;
+    set_state(ctx, AutoseqState::CALLING, TxMsgType::TX6, 0);
+
+    sort_and_clean();
+    ESP_LOGI(TAG, "Scheduled FreeText on slot %d: %s", slot_parity, text.c_str());
+    return true;
 }
 
 void autoseq_on_touch(const UiRxLine& msg) {
@@ -522,6 +561,11 @@ static void format_tx_text(QsoContext* ctx, TxMsgType id, std::string& out) {
             break;
 
         case TxMsgType::TX6: {
+            if (ctx->is_freetext) {
+                out = s_pending_ft_text;
+                return;
+            }
+
             const char* cq_prefix = "CQ";
             switch (s_cq_type) {
                 case AutoseqCqType::SOTA: cq_prefix = "CQ SOTA"; break;
@@ -952,6 +996,15 @@ static void on_decode(const UiRxLine& msg) {
 // Only used on the active zone [0 .. s_active_count)
 // Returns true if left should come before right
 static bool compare_ctx(const QsoContext& left, const QsoContext& right) {
+    if (left.state == AutoseqState::IDLE && right.state != AutoseqState::IDLE) return true;
+    if (right.state == AutoseqState::IDLE && left.state != AutoseqState::IDLE) return false;
+
+    // FreeText is a one-shot operator action and should be the next TX even
+    // when a QSO retry was already armed. The displaced QSO remains queued.
+    if (left.is_freetext != right.is_freetext) {
+        return left.is_freetext;
+    }
+
     // Same state? Lower retry count gets priority — round-robin among
     // contacts so we probe for viable propagation paths rather than
     // burning all retries on one potentially dead contact.

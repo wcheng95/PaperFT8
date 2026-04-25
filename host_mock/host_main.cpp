@@ -160,6 +160,15 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // --- FreeText event ---
+        if (tp.has_freetext_event) {
+            int fallback_parity = (int)((slot_idx + 1) & 1);
+            bool ok = autoseq_schedule_freetext(tp.freetext_event.text, fallback_parity);
+            printf("[Period %d @ %.1fs] FreeText: %s (scheduled=%d)\n",
+                   p, tp.freetext_event.time_offset,
+                   tp.freetext_event.text.c_str(), ok ? 1 : 0);
+        }
+
         // --- TX phase ---
         AutoseqTxEntry pending;
         bool has_tx = autoseq_fetch_pending_tx(pending);

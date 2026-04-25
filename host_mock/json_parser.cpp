@@ -107,6 +107,15 @@ bool load_test_data(const std::string& filename, TestData& out) {
             period.touch_event.message_index = te.value("message_index", 0);
         }
 
+        // freetext_event
+        if (pj.contains("freetext_event")) {
+            auto& fe = pj["freetext_event"];
+            period.has_freetext_event = true;
+            period.freetext_event.time_offset = fe.value("time_offset", 0.0f);
+            period.freetext_event.text        = fe.value("text", std::string(""));
+            substitute(period.freetext_event.text, out.config);
+        }
+
         out.periods.push_back(std::move(period));
     }
 

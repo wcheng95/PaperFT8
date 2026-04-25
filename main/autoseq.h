@@ -61,6 +61,7 @@ struct QsoContext {
 
     int offset_hz = 1500;   // TX audio offset
     int slot_id = 0;        // TX slot (0=even, 1=odd)
+    bool is_freetext = false; // One-shot FreeText marker, prioritized above QSOs
 };
 
 // TX entry for scheduling
@@ -97,6 +98,11 @@ bool autoseq_rotate_same_parity();
 // Start a CQ call (adds CQ to queue)
 // slot_parity: 0 for even slots, 1 for odd slots
 void autoseq_start_cq(int slot_parity);
+
+// Schedule a one-shot FreeText transmission through the autoseq queue.
+// If a QSO is active, FreeText inherits the queue head parity and preempts it.
+// If the queue is empty, fallback_slot_parity selects the next TX slot.
+bool autoseq_schedule_freetext(const std::string& text, int fallback_slot_parity);
 
 // Manual response: user taps on a decoded message
 void autoseq_on_touch(const UiRxLine& msg);
