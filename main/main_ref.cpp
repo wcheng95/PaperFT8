@@ -2942,6 +2942,10 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       others.push_back(l);
     }
   }
+  std::stable_sort(cqs.begin(), cqs.end(),
+                   [](const UiRxLine& a, const UiRxLine& b) {
+                     return a.snr > b.snr;
+                   });
 
   // ---- autoseq trigger logic (unchanged idea) ----
   if (!g_was_txing) {
