@@ -108,9 +108,22 @@ static bool g_ble_nvs_ready = false;
 static bool g_ble_force_send = false;
 static std::string g_ble_adv_name;
 static std::string g_ble_last_payload;
+static std::string g_ble_last_screen_lines[6];
+static std::string g_ble_last_line7;
+static bool g_ble_last_screen_valid = false;
+static int64_t g_ble_status_clock_slot_sent = -1;
 static int64_t g_ble_last_tick_slot = -1;
 static int g_ble_last_tick_sec = -1;
+static std::string g_ble_waterfall_header = "|                           |";
+static int64_t g_ble_waterfall_slot_idx = -1;
 static bool g_ble_text_mode = false;
+static volatile uint32_t g_ble_decode_event_seq = 0;
+static volatile int g_ble_decode_event_count = 0;
+static uint32_t g_ble_decode_event_seq_seen = 0;
+static void ble_publish_decode_event(int decoded_count) {
+  g_ble_decode_event_count = decoded_count;
+  g_ble_decode_event_seq = g_ble_decode_event_seq + 1;
+}
 static uint8_t g_own_addr_type = 0;
 static const char* BT_TAG = "BLE_INIT";
 
@@ -154,6 +167,8 @@ static bool ble_ensure_nvs_ready(void);
 static void ble_reset_runtime_state(void);
 static void ble_delete_cmd_queue(void);
 static void ble_countdown_tick();
+static std::string ble_blank_waterfall_header();
+static void ble_update_waterfall_header_if_due(int64_t slot_idx, int sec);
 static int ble_send_payload_raw(const std::string& payload, bool indicate);
 static bool ble_wait_for_indicate_ack(int timeout_ms);
 static void ble_dump_reset_transfer_state(bool use_indicate);
@@ -299,8 +314,13 @@ static void ble_reset_runtime_state(void) {
     g_ble_synced = false;
     g_ble_force_send = false;
     g_ble_last_payload.clear();
+    g_ble_last_screen_valid = false;
+    g_ble_last_line7.clear();
+    g_ble_status_clock_slot_sent = -1;
     g_ble_last_tick_slot = -1;
     g_ble_last_tick_sec = -1;
+    g_ble_waterfall_slot_idx = -1;
+    g_ble_waterfall_header = ble_blank_waterfall_header();
     g_ble_text_mode = false;
     g_ble_qso_pick_mode = false;
     g_ble_dump_in_progress = false;
@@ -438,8 +458,13 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
               return 0;
             }
             g_ble_force_send = true;
+            g_ble_last_screen_valid = false;
+            g_ble_last_line7.clear();
+            g_ble_status_clock_slot_sent = -1;
             g_ble_last_tick_slot = -1;
             g_ble_last_tick_sec = -1;
+            g_ble_waterfall_slot_idx = -1;
+            g_ble_waterfall_header = ble_blank_waterfall_header();
             g_ble_text_mode = false;
             g_ble_tx_notify_enabled = false;
             g_ble_tx_indicate_enabled = false;
@@ -457,8 +482,13 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_ble_last_payload.clear();
+        g_ble_last_screen_valid = false;
+        g_ble_last_line7.clear();
+        g_ble_status_clock_slot_sent = -1;
         g_ble_last_tick_slot = -1;
         g_ble_last_tick_sec = -1;
+        g_ble_waterfall_slot_idx = -1;
+        g_ble_waterfall_header = ble_blank_waterfall_header();
         g_ble_text_mode = false;
         g_ble_tx_notify_enabled = false;
         g_ble_tx_indicate_enabled = false;
@@ -2733,6 +2763,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     g_rx_lines.clear();
     if (update_ui) { ui_set_rx_list(g_rx_lines); ui_draw_rx(); }
     else g_rx_dirty = true;
+    ble_publish_decode_event(0);
     g_decode_in_progress = false;  // Clear flag before early return
     return;
   }
@@ -2967,6 +2998,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   } else {
     g_rx_dirty = true;
   }
+  ble_publish_decode_event((int)g_rx_lines.size());
 
 #ifdef DEBUG_LOG
     //char buf[32];
@@ -3966,8 +3998,13 @@ static void apply_ble_enabled_policy(bool runtime_apply) {
   }
 
   g_ble_force_send = true;
+  g_ble_last_screen_valid = false;
+  g_ble_last_line7.clear();
+  g_ble_status_clock_slot_sent = -1;
   g_ble_last_tick_slot = -1;
   g_ble_last_tick_sec = -1;
+  g_ble_waterfall_slot_idx = -1;
+  g_ble_waterfall_header = ble_blank_waterfall_header();
   if (g_ble_stack_active && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
     ble_app_advertise();
   }
@@ -4138,6 +4175,64 @@ static std::string ble_timing_token(int sec, bool even_slot, bool txing) {
   return even_slot ? ":" : ".";
 }
 
+static std::string ble_blank_waterfall_header() {
+  return "|                           |";
+}
+
+static void ble_update_waterfall_header_if_due(int64_t slot_idx, int sec) {
+  if (sec != 12) return;
+  if (g_ble_waterfall_slot_idx == slot_idx) return;
+  g_ble_waterfall_slot_idx = slot_idx;
+
+  uint8_t row[UAC_WATERFALL_ROW_WIDTH] = {};
+  if (!uac_get_latest_waterfall_row(row, sizeof(row))) {
+    g_ble_waterfall_header = ble_blank_waterfall_header();
+    return;
+  }
+
+  constexpr int kBleWfBins = 27;
+  uint8_t bins[kBleWfBins] = {};
+  for (int i = 0; i < kBleWfBins; ++i) {
+    int start = (int)((int64_t)i * UAC_WATERFALL_ROW_WIDTH / kBleWfBins);
+    int end = (int)((int64_t)(i + 1) * UAC_WATERFALL_ROW_WIDTH / kBleWfBins);
+    if (end <= start) end = start + 1;
+    uint8_t vmax = 0;
+    for (int x = start; x < end && x < UAC_WATERFALL_ROW_WIDTH; ++x) {
+      if (row[x] > vmax) vmax = row[x];
+    }
+    bins[i] = vmax;
+  }
+
+  uint8_t min_v = 255;
+  uint8_t max_v = 0;
+  for (int i = 0; i < kBleWfBins; ++i) {
+    if (bins[i] < min_v) min_v = bins[i];
+    if (bins[i] > max_v) max_v = bins[i];
+  }
+
+  static const char kChars[4] = {' ', '.', ':', '!'};
+  char chars[kBleWfBins + 1];
+  chars[kBleWfBins] = '\0';
+  if (max_v <= min_v) {
+    for (int i = 0; i < kBleWfBins; ++i) chars[i] = ' ';
+  } else {
+    const int span = (int)max_v - (int)min_v;
+    for (int i = 0; i < kBleWfBins; ++i) {
+      const int scaled = (int)bins[i] - (int)min_v;
+      int level = (scaled * 3 + (span / 2)) / span;
+      if (level < 0) level = 0;
+      if (level > 3) level = 3;
+      chars[i] = kChars[level];
+    }
+  }
+
+  g_ble_waterfall_header.clear();
+  g_ble_waterfall_header.reserve(kBleWfBins + 2);
+  g_ble_waterfall_header.push_back('|');
+  g_ble_waterfall_header.append(chars, kBleWfBins);
+  g_ble_waterfall_header.push_back('|');
+}
+
 static void ble_notify_line(const std::string& raw) {
   std::string line = raw;
   while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
@@ -4217,6 +4312,19 @@ static void ble_try_dump_qso_file_by_key(char key) {
   ble_dump_qso_file(g_q_files[idx]);
 }
 
+static bool ble_status_clock_only_delta(const std::vector<std::string>& lines,
+                                        const std::string& line7) {
+  if (!g_ble_last_screen_valid) return false;
+  if (line7 != g_ble_last_line7) return false;
+  bool changed = false;
+  for (int i = 0; i < 6; ++i) {
+    if (lines[i] == g_ble_last_screen_lines[i]) continue;
+    if (i != 4 && i != 5) return false;
+    changed = true;
+  }
+  return changed;
+}
+
 static void ble_mirror_tick() {
   if (!g_ble_enabled) return;
   if (g_ble_dump_in_progress) return;
@@ -4228,6 +4336,30 @@ static void ble_mirror_tick() {
 
   const std::string line7 = g_ble_text_mode ? ble_text_mode_line7() : ble_meta_line();
 
+  bool snapshot_changed = g_ble_force_send || !g_ble_last_screen_valid || (line7 != g_ble_last_line7);
+  if (!snapshot_changed) {
+    for (int i = 0; i < 6; ++i) {
+      if (lines[i] != g_ble_last_screen_lines[i]) {
+        snapshot_changed = true;
+        break;
+      }
+    }
+  }
+  if (!snapshot_changed) return;
+
+  int64_t status_slot_idx = -1;
+  if (!g_ble_force_send &&
+      ui_mode == UIMode::STATUS &&
+      !g_ble_text_mode &&
+      ble_status_clock_only_delta(lines, line7)) {
+    int sec = 0;
+    bool even_slot = true;
+    ble_slot_second_now(status_slot_idx, sec, even_slot);
+    if (g_ble_status_clock_slot_sent == status_slot_idx) {
+      return;
+    }
+  }
+
   std::string screen_key;
   screen_key.reserve(256);
   for (int i = 0; i < 6; ++i) {
@@ -4236,24 +4368,44 @@ static void ble_mirror_tick() {
   }
   screen_key += line7;
 
-  if (g_ble_force_send || screen_key != g_ble_last_payload) {
-    g_ble_force_send = false;
-    g_ble_last_payload = screen_key;
-    if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
-      int64_t slot_idx = 0;
+  g_ble_force_send = false;
+  g_ble_last_payload = screen_key;
+  for (int i = 0; i < 6; ++i) {
+    g_ble_last_screen_lines[i] = lines[i];
+  }
+  g_ble_last_line7 = line7;
+  g_ble_last_screen_valid = true;
+
+  if (ui_mode == UIMode::STATUS && !g_ble_text_mode) {
+    if (status_slot_idx < 0) {
       int sec = 0;
       bool even_slot = true;
-      ble_slot_second_now(slot_idx, sec, even_slot);
-      (void)even_slot;
-      g_ble_last_tick_slot = slot_idx;
-      g_ble_last_tick_sec = sec;
+      ble_slot_second_now(status_slot_idx, sec, even_slot);
     }
-    std::string out;
-    out.reserve(screen_key.size() + 40);
-    out += "\n==========================\n";
-    out += screen_key;
-    ble_notify_payload(out);
+    g_ble_status_clock_slot_sent = status_slot_idx;
   }
+
+  if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
+    int64_t slot_idx = 0;
+    int sec = 0;
+    bool even_slot = true;
+    ble_slot_second_now(slot_idx, sec, even_slot);
+    (void)even_slot;
+    g_ble_last_tick_slot = slot_idx;
+    g_ble_last_tick_sec = sec;
+  }
+
+  std::string out;
+  out.reserve(screen_key.size() + 120);
+  out += "\n";
+  out += std::string(29, '=');
+  out += "\n";
+  out += g_ble_waterfall_header.empty() ? ble_blank_waterfall_header() : g_ble_waterfall_header;
+  out += "\n";
+  out += "---.----+----.----+----.----+";
+  out += "\n";
+  out += screen_key;
+  ble_notify_payload(out);
 }
 
 static void ble_countdown_tick() {
@@ -4261,10 +4413,21 @@ static void ble_countdown_tick() {
   if (g_ble_dump_in_progress) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
+  const uint32_t seq = g_ble_decode_event_seq;
+  if (seq != g_ble_decode_event_seq_seen) {
+    g_ble_decode_event_seq_seen = seq;
+    if (!g_ble_text_mode) {
+      char buf[24];
+      std::snprintf(buf, sizeof(buf), "[D:%d]", g_ble_decode_event_count);
+      ble_notify_payload(std::string(buf));
+    }
+  }
+
   int64_t slot_idx = 0;
   int sec = 0;
   bool even_slot = true;
   ble_slot_second_now(slot_idx, sec, even_slot);
+  ble_update_waterfall_header_if_due(slot_idx, sec);
 
   if (g_ble_last_tick_slot == slot_idx && g_ble_last_tick_sec == sec) return;
   if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {

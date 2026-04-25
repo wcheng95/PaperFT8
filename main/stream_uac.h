@@ -17,6 +17,8 @@ extern "C" {
 #define UAC_BUFFER_SIZE     16000   // Ringbuffer size in bytes
 #define UAC_BUFFER_THRESHOLD 1000   // ~3.5ms at 48kHz stereo 24-bit
 
+#define UAC_WATERFALL_ROW_WIDTH 240
+
 // UAC streaming state
 typedef enum {
     UAC_STATE_IDLE,         // Not initialized or stopped
@@ -49,6 +51,10 @@ const char* uac_get_status_string(void);
 // Returns pointer to static buffer, do not free
 const char* uac_get_debug_line1(void);
 const char* uac_get_debug_line2(void);
+
+// Copy the latest scaled waterfall row (240 bins) produced by UAC streaming.
+// Returns false when no valid row is available.
+bool uac_get_latest_waterfall_row(uint8_t* out_row, int out_len);
 
 // USB CDC-ACM (CAT control) helpers
 bool cat_cdc_ready(void);

@@ -22,7 +22,6 @@ extern "C" {
 #include <cstring>
 #include <cmath>
 #include <inttypes.h>
-#include <vector>
 
 static const char* TAG = "UAC_STREAM";
 extern void log_heap(const char* tag);
@@ -95,6 +94,9 @@ static char s_debug_line2[64] = "";
 
 // Resampler state
 static resample_state_t s_resample_state;
+static uint8_t s_latest_waterfall_row[UAC_WATERFALL_ROW_WIDTH] = {0};
+static bool s_latest_waterfall_row_valid = false;
+static portMUX_TYPE s_latest_waterfall_row_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // Forward declarations
 static void usb_lib_task(void* arg);
@@ -110,12 +112,12 @@ static void push_waterfall_latest(const monitor_t& mon) {
     if (mon.wf.num_blocks <= 0 || mon.wf.mag == nullptr) return;
     const int block = mon.wf.num_blocks - 1;
     const int num_bins = mon.wf.num_bins;
-    if (num_bins <= 0) return;
+    if (num_bins <= 0 || num_bins > 480) return;
     const int freq_osr = mon.wf.freq_osr;
     const uint8_t* base = mon.wf.mag + block * mon.wf.block_stride;
 
-    static std::vector<uint8_t> collapsed;
-    collapsed.assign(num_bins, 0);
+    static uint8_t collapsed[480];
+    memset(collapsed, 0, num_bins);
     for (int b = 0; b < num_bins; ++b) {
         uint8_t v = 0;
         for (int fs = 0; fs < freq_osr; ++fs) {
@@ -125,7 +127,24 @@ static void push_waterfall_latest(const monitor_t& mon) {
         collapsed[b] = v;
     }
 
-    ui_push_waterfall_row(collapsed.data(), num_bins);
+    constexpr int width = UAC_WATERFALL_ROW_WIDTH;
+    static uint8_t scaled[width];
+    for (int x = 0; x < width; ++x) {
+        int start = (int)((int64_t)x * num_bins / width);
+        int end = (int)((int64_t)(x + 1) * num_bins / width);
+        if (end <= start) end = start + 1;
+        uint8_t maxv = 0;
+        for (int s = start; s < end && s < num_bins; ++s) {
+            if (collapsed[s] > maxv) maxv = collapsed[s];
+        }
+        scaled[x] = maxv;
+    }
+
+    ui_push_waterfall_row(scaled, width);
+    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
+    memcpy(s_latest_waterfall_row, scaled, width);
+    s_latest_waterfall_row_valid = true;
+    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
 }
 
 // CDC-ACM helpers (CAT TX only)
@@ -662,6 +681,18 @@ bool uac_is_streaming(void) {
     return s_state == UAC_STATE_STREAMING && s_mic_handle != NULL;
 }
 
+bool uac_get_latest_waterfall_row(uint8_t* out_row, int out_len) {
+    if (!out_row || out_len < UAC_WATERFALL_ROW_WIDTH) return false;
+    bool valid = false;
+    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
+    valid = s_latest_waterfall_row_valid;
+    if (valid) {
+        memcpy(out_row, s_latest_waterfall_row, UAC_WATERFALL_ROW_WIDTH);
+    }
+    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
+    return valid;
+}
+
 bool uac_start(void) {
     if (s_state != UAC_STATE_IDLE) {
         ESP_LOGW(TAG, "UAC already started");
@@ -675,6 +706,10 @@ bool uac_start(void) {
     ESP_LOGI(TAG, "Starting UAC host");
     s_stop_requested = false;
     resample_init(&s_resample_state);
+    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
+    memset(s_latest_waterfall_row, 0, sizeof(s_latest_waterfall_row));
+    s_latest_waterfall_row_valid = false;
+    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
 
     // Create event queue
     s_event_queue = xQueueCreate(10, sizeof(uac_event_t));
@@ -745,6 +780,10 @@ void uac_stop(void) {
     }
 
     s_state = UAC_STATE_IDLE;
+    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
+    memset(s_latest_waterfall_row, 0, sizeof(s_latest_waterfall_row));
+    s_latest_waterfall_row_valid = false;
+    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
     snprintf(s_status_string, sizeof(s_status_string), "Idle");
     ESP_LOGI(TAG, "UAC host stopped");
 }
