@@ -4018,6 +4018,10 @@ static void ble_update_name_from_station(bool restart_adv) {
 }
 
 static const char* ble_page_label(UIMode mode) {
+  if (mode == UIMode::QSO && g_ble_qso_pick_mode) {
+    return "Fetch";
+  }
+
   switch (mode) {
     case UIMode::RX: return "RX";
     case UIMode::TX: return "TX";
@@ -5467,9 +5471,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         switched = true;
       }
-      else if ((c == 'f' || c == 'F') && c_from_ble) {
+      else if (c == 'f' || c == 'F') {
         cancel_status_edit();
-        ble_start_qso_pick_mode();
+        if (ui_mode == UIMode::QSO && g_ble_qso_pick_mode) {
+          g_ble_qso_return_mode = UIMode::RX;
+          ble_cancel_qso_pick_mode();
+        } else {
+          ble_start_qso_pick_mode();
+        }
         switched = true;
       }
       else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
@@ -5758,7 +5767,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         case UIMode::QSO: {
 #if ENABLE_BLE
-          if (g_ble_qso_pick_mode && c_from_ble) {
+          if (g_ble_qso_pick_mode) {
             if (c == ';') {
               if (q_page > 0) { q_page--; qso_draw_page(); }
             } else if (c == '.') {
