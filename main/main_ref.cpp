@@ -1690,7 +1690,7 @@ static void qso_load_entries(const std::string& path) {
     g_q_lines.push_back("Open fail");
     return;
   }
-  char line[256];
+  char line[512];
   while (fgets(line, sizeof(line), f)) {
     std::string s(line);
     std::string s_lower = s;
@@ -3996,18 +3996,33 @@ static void ble_dump_reset_transfer_state(bool use_indicate) {
   g_ble_indicate_status = 0;
 }
 
-static bool ble_dump_send_line(const std::string& raw) {
-  std::string line = raw;
-  while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-    line.pop_back();
+static size_t ble_dump_max_chunk_len() {
+  // BLE notification/indication usable payload is ATT_MTU - 3.
+  // Use g_ble_att_mtu if available; otherwise default to 23-byte MTU => 20-byte payload.
+  uint16_t mtu = g_ble_att_mtu;
+  if (mtu < 23) mtu = 23;
+
+  size_t n = (size_t)mtu - 3;
+
+  // Conservative cap. Helps avoid phone-side / NimBLE queue issues.
+  if (n > 180) n = 180;
+  if (n < 20) n = 20;
+
+  return n;
+}
+
+static bool ble_dump_send_chunk(const std::string& chunk) {
+  if (chunk.empty()) {
+    return true;
   }
-  std::string payload = line + "\n";
 
   if (g_ble_dump_xfer.mode == BleDumpTxMode::Indicate) {
     for (int attempt = 0; attempt <= kBleDumpIndicateMaxRetries; ++attempt) {
       g_ble_indicate_status = 0;
       g_ble_indicate_waiting = true;
-      const int rc = ble_send_payload_raw(payload, true);
+
+      const int rc = ble_send_payload_raw(chunk, true);
+
       if (rc == 0) {
         if (ble_wait_for_indicate_ack(kBleDumpIndicateAckTimeoutMs)) {
           return true;
@@ -4016,38 +4031,74 @@ static bool ble_dump_send_line(const std::string& raw) {
         g_ble_indicate_waiting = false;
         g_ble_indicate_status = rc;
       }
+
       if (attempt < kBleDumpIndicateMaxRetries) {
         g_ble_dump_xfer.retries++;
-        const int bi = attempt < kBleDumpNotifyMaxRetries ? attempt : (kBleDumpNotifyMaxRetries - 1);
+
+        const int bi = attempt < kBleDumpNotifyMaxRetries
+                         ? attempt
+                         : (kBleDumpNotifyMaxRetries - 1);
+
         vTaskDelay(pdMS_TO_TICKS(kBleDumpNotifyBackoffMs[bi]));
       }
     }
-    g_ble_dump_xfer.failed_lines++;
+
     return false;
   }
 
   int attempt = 0;
+
   for (; attempt <= kBleDumpNotifyMaxRetries; ++attempt) {
-    const int rc = ble_send_payload_raw(payload, false);
+    const int rc = ble_send_payload_raw(chunk, false);
     if (rc == 0) break;
+
     if (attempt < kBleDumpNotifyMaxRetries) {
       g_ble_dump_xfer.retries++;
       vTaskDelay(pdMS_TO_TICKS(kBleDumpNotifyBackoffMs[attempt]));
     }
   }
+
   if (attempt > kBleDumpNotifyMaxRetries) {
-    g_ble_dump_xfer.failed_lines++;
     return false;
   }
 
   if (attempt > 0) {
     int next_pace = g_ble_dump_xfer.notify_pace_ms + (attempt * 2);
-    if (next_pace > kBleDumpNotifyPaceMaxMs) next_pace = kBleDumpNotifyPaceMaxMs;
+    if (next_pace > kBleDumpNotifyPaceMaxMs) {
+      next_pace = kBleDumpNotifyPaceMaxMs;
+    }
     g_ble_dump_xfer.notify_pace_ms = next_pace;
   } else if (g_ble_dump_xfer.notify_pace_ms > kBleDumpNotifyPaceMinMs) {
     g_ble_dump_xfer.notify_pace_ms--;
   }
+
   vTaskDelay(pdMS_TO_TICKS(g_ble_dump_xfer.notify_pace_ms));
+  return true;
+}
+
+static bool ble_dump_send_line(const std::string& raw) {
+  std::string line = raw;
+
+  while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+    line.pop_back();
+  }
+
+  std::string payload = line + "\n";
+
+  const size_t max_chunk = ble_dump_max_chunk_len();
+
+  for (size_t pos = 0; pos < payload.size(); pos += max_chunk) {
+    const size_t remain = payload.size() - pos;
+    const size_t n = remain > max_chunk ? max_chunk : remain;
+
+    std::string chunk = payload.substr(pos, n);
+
+    if (!ble_dump_send_chunk(chunk)) {
+      g_ble_dump_xfer.failed_lines++;
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -4347,7 +4398,7 @@ static void ble_dump_qso_file(const std::string& file_name) {
   if (!f) {
     (void)ble_dump_send_line("Open fail");
   } else {
-    char line[256];
+    char line[512];
     while (fgets(line, sizeof(line), f)) {
       g_ble_dump_xfer.file_lines++;
       (void)ble_dump_send_line(line);
