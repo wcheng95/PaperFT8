@@ -1366,6 +1366,10 @@ static void touch_keyboard_process_touch();
 static void touch_keyboard_end_session();
 static const char* menu_edit_label(int idx);
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
+static std::string normalize_grid_maidenhead(const std::string& src);
+static std::string grid_ft8_4(const std::string& grid);
+static bool apply_station_grid_edit(const std::string& text);
+static std::string expand_comment_macros(const std::string& src);
 static void update_countdown();
 static void menu_flash_tick();
 static void rx_flash_tick();
@@ -1814,23 +1818,8 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   char freq_str[16];
   snprintf(freq_str, sizeof(freq_str), "%.3f", freq_mhz);
 
-  std::string comment_expanded = g_comment1;
-  auto repl = [](std::string& s, const std::string& from, const std::string& to) {
-    size_t pos = 0;
-    while ((pos = s.find(from, pos)) != std::string::npos) {
-      s.replace(pos, from.size(), to);
-      pos += to.size();
-    }
-  };
-  // Expand placeholders using current radio string
-  auto radio_name_local = [](RadioType r) {
-    switch (r) {
-      case RadioType::TRUSDX: return "QMX";
-      case RadioType::QMX: return "QMX";
-      default: return "None";
-    }
-  };
-  repl(comment_expanded, "/Radio", radio_name_local(g_radio));
+  const std::string comment_expanded = expand_comment_macros(g_comment1);
+  const std::string my_grid4 = grid_ft8_4(g_grid);
   // Build rst_sent/rst_rcvd fragments — omit when -99 (no data),
   // matching DXFT8 reference behavior (ADIF.c omits when value is 0).
   char rst_sent_buf[32] = "";
@@ -1849,7 +1838,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
           date, time_on,
           strlen(freq_str), freq_str,
           g_call.size(), g_call.c_str(),
-          g_grid.size(), g_grid.c_str(),
+          my_grid4.size(), my_grid4.c_str(),
           rst_sent_buf, rst_rcvd_buf,
           comment_expanded.size(), comment_expanded.c_str());
   fclose(f);
@@ -2110,7 +2099,11 @@ static const char* radio_name(RadioType r) {
 }
 
 static std::string expand_comment1() {
-  std::string out = g_comment1;
+  return expand_comment_macros(g_comment1);
+}
+
+static std::string expand_comment_macros(const std::string& src) {
+  std::string out = src;
   auto repl = [](std::string& s, const std::string& from, const std::string& to) {
     size_t pos = 0;
     while ((pos = s.find(from, pos)) != std::string::npos) {
@@ -2119,6 +2112,7 @@ static std::string expand_comment1() {
     }
   };
   repl(out, "/Radio", radio_name(g_radio));
+  repl(out, "/Grid", g_grid);
   return out;
 }
 
@@ -3358,11 +3352,10 @@ static void touch_keyboard_commit_current() {
     case TouchKbdEditTarget::MenuEdit: {
       if (menu_edit_idx == 3) {
         g_call = menu_edit_buf;
-        autoseq_set_station(g_call, g_grid);
+        autoseq_set_station(g_call, grid_ft8_4(g_grid));
         ble_update_name_from_station(true);
       } else if (menu_edit_idx == 4) {
-        g_grid = menu_edit_buf;
-        autoseq_set_station(g_call, g_grid);
+        apply_station_grid_edit(menu_edit_buf);
       } else if (menu_edit_idx == 7) {
         g_offset_hz = atoi(menu_edit_buf.c_str());
       } else if (menu_edit_idx == 10) {
@@ -4587,6 +4580,80 @@ static std::string trim_copy(const std::string& s) {
   return s.substr(b, e - b);
 }
 
+static std::string normalize_grid_maidenhead(const std::string& src) {
+  const std::string s = trim_copy(src);
+  if (!(s.size() == 4 || s.size() == 6 || s.size() == 8)) return "";
+
+  auto upper = [](char c) {
+    return static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  };
+  auto lower = [](char c) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  };
+  auto in_range = [](char c, char lo, char hi) {
+    return c >= lo && c <= hi;
+  };
+
+  const char a0 = upper(s[0]);
+  const char a1 = upper(s[1]);
+  if (!in_range(a0, 'A', 'R') || !in_range(a1, 'A', 'R')) return "";
+  if (!std::isdigit(static_cast<unsigned char>(s[2])) ||
+      !std::isdigit(static_cast<unsigned char>(s[3]))) {
+    return "";
+  }
+
+  std::string out;
+  out.reserve(s.size());
+  out.push_back(a0);
+  out.push_back(a1);
+  out.push_back(s[2]);
+  out.push_back(s[3]);
+
+  if (s.size() >= 6) {
+    const char a4 = upper(s[4]);
+    const char a5 = upper(s[5]);
+    if (!in_range(a4, 'A', 'X') || !in_range(a5, 'A', 'X')) return "";
+    out.push_back(lower(a4));
+    out.push_back(lower(a5));
+  }
+
+  if (s.size() == 8) {
+    if (!std::isdigit(static_cast<unsigned char>(s[6])) ||
+        !std::isdigit(static_cast<unsigned char>(s[7]))) {
+      return "";
+    }
+    out.push_back(s[6]);
+    out.push_back(s[7]);
+  }
+
+  return out;
+}
+
+static std::string grid_ft8_4(const std::string& grid) {
+  const std::string norm = normalize_grid_maidenhead(grid);
+  if (norm.size() >= 4) return norm.substr(0, 4);
+  return "CM97";
+}
+
+static void report_station_grid_error() {
+  static const char* kMsg = "Grid format: AA00/AA00aa/AA00aa00";
+  debug_log_line(kMsg);
+#if ENABLE_BLE
+  ble_notify_line(std::string("ERROR: ") + kMsg);
+#endif
+}
+
+static bool apply_station_grid_edit(const std::string& text) {
+  const std::string norm = normalize_grid_maidenhead(text);
+  if (norm.empty()) {
+    report_station_grid_error();
+    return false;
+  }
+  g_grid = norm;
+  autoseq_set_station(g_call, grid_ft8_4(g_grid));
+  return true;
+}
+
 static uint32_t parse_crc_hex(const std::string& hex) {
   if (hex.empty()) return 0;
   char* end = nullptr;
@@ -4979,7 +5046,8 @@ static void load_station_data() {
     } else if (strncmp(line, "call=", 5) == 0) {
       g_call = trim_copy(line + 5);
     } else if (strncmp(line, "grid=", 5) == 0) {
-      g_grid = trim_copy(line + 5);
+      const std::string norm_grid = normalize_grid_maidenhead(line + 5);
+      if (!norm_grid.empty()) g_grid = norm_grid;
     } else if (strncmp(line, "comment1=", 9) == 0) {
       g_comment1 = trim_copy(line + 9);
     } else if (strncmp(line, "ignore_prefixes=", 16) == 0) {
@@ -5009,7 +5077,6 @@ static void load_station_data() {
   g_cq_freetext = uppercase_ascii_copy(g_cq_freetext);
   g_free_text = uppercase_ascii_copy(g_free_text);
   g_call = uppercase_ascii_copy(g_call);
-  g_grid = uppercase_ascii_copy(g_grid);
   g_ignore_prefix_text = clamp_ignore_prefix_text(uppercase_ascii_copy(g_ignore_prefix_text));
   g_active_band_text = uppercase_ascii_copy(g_active_band_text);
   autoseq_set_max_retry(g_autoseq_max_retry);
@@ -5213,18 +5280,19 @@ static void ble_commit_text_input(const BleUiInput& input) {
   }
 
   if (menu_edit_idx >= 0) {
-    const size_t max_len = (menu_edit_idx == 7 || menu_edit_idx == 17) ? 10 : (sizeof(g_touchkbd_buffer) - 1);
+    const size_t max_len = (menu_edit_idx == 7 || menu_edit_idx == 17)
+                               ? 10
+                               : (menu_edit_idx == 4 ? 8 : (sizeof(g_touchkbd_buffer) - 1));
     if (value.size() > max_len) value.resize(max_len);
     menu_edit_buf = normalize_menu_edit_case(menu_edit_idx, value);
 
     // Absolute indices across pages.
     if (menu_edit_idx == 3) {
       g_call = menu_edit_buf;
-      autoseq_set_station(g_call, g_grid);
+      autoseq_set_station(g_call, grid_ft8_4(g_grid));
       ble_update_name_from_station(true);
     } else if (menu_edit_idx == 4) {
-      g_grid = menu_edit_buf;
-      autoseq_set_station(g_call, g_grid);
+      apply_station_grid_edit(menu_edit_buf);
     } else if (menu_edit_idx == 7) {
       g_offset_hz = atoi(menu_edit_buf.c_str());
     } else if (menu_edit_idx == 10) {
@@ -5335,7 +5403,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   update_autoseq_cq_type();
 
   // Update autoseq with station info after loading
-  autoseq_set_station(g_call, g_grid);
+  autoseq_set_station(g_call, grid_ft8_4(g_grid));
 
   // Prepare RX list (but don't draw yet - startup screen may be shown)
   std::vector<UiRxLine> empty;
@@ -6084,8 +6152,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             } else if (menu_edit_idx >= 0) {
               if (c == '\n' || c == '\r') {
                 // Absolute indices across pages
-                if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
-                else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+                if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, grid_ft8_4(g_grid)); }
+                else if (menu_edit_idx == 4) { apply_station_grid_edit(menu_edit_buf); }
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
                 else if (menu_edit_idx == 17) {
@@ -6118,6 +6186,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 }
                 if (!menu_edit_allows_mixed_case(menu_edit_idx)) {
                   ch = toupper((unsigned char)ch);
+                }
+                if (menu_edit_idx == 4 && menu_edit_buf.size() >= 8) {
+                  break;
                 }
                 menu_edit_buf.push_back(ch);
                 draw_menu_view();
