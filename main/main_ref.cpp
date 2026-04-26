@@ -545,6 +545,11 @@ static bool ble_pop_input(BleUiInput& out) {
 #endif // ENABLE_BLE
 
 int64_t rtc_now_ms();
+struct CopyLogsResult {
+  esp_err_t err = ESP_OK;
+  int copied_count = 0;
+  int missed_count = 0;
+};
 static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path);
 
 static void debug_log_line(const std::string& msg);
@@ -641,7 +646,7 @@ void unmount_sd_spi(const char *mount_point)
     spi_bus_free(SPI2_HOST);
 }
 
-// ---------- Log copy/delete helpers ----------
+// ---------- Log copy helpers ----------
 static bool sdcard_is_mounted() {
   struct stat st;
   return (stat("/sdcard", &st) == 0) && S_ISDIR(st.st_mode);
@@ -732,62 +737,117 @@ static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path)
   return ESP_OK;
 }
 
-// Copy all regular files from SPIFFS -> SD card, overwriting destination.
-static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
-  esp_err_t mret = ensure_sdcard_mounted();
-  if (mret != ESP_OK) return mret;
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  DIR* d = opendir("/spiffs");
-  if (!d) {
-    unmount_sd_spi("/sdcard");
-    return ESP_FAIL;
-  }
-
-  esp_err_t last_err = ESP_OK;
-  struct dirent* ent;
-
-  while ((ent = readdir(d)) != nullptr) {
-    const char* name = ent->d_name;
-    if (!name || name[0] == '.') continue;
-
-    std::string src = std::string("/spiffs/") + name;
-
-    struct stat st;
-    bool stat_ok = false;
-    for (int i = 0; i < 5; ++i) {
-      if (stat(src.c_str(), &st) == 0) { stat_ok = true; break; }
-      vTaskDelay(pdMS_TO_TICKS(50));
+static esp_err_t copy_file_overwrite_retry(const char* src_path, const char* dst_path,
+                                           int max_attempts = 5, int retry_delay_ms = 80) {
+  if (max_attempts < 1) max_attempts = 1;
+  esp_err_t last_err = ESP_FAIL;
+  for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    last_err = copy_file_overwrite(src_path, dst_path);
+    if (last_err == ESP_OK) return ESP_OK;
+    if (attempt + 1 < max_attempts) {
+      vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
     }
-    if (!stat_ok) { last_err = ESP_FAIL; continue; }
-    if (!S_ISREG(st.st_mode)) continue;
-
-    std::string dst = std::string("/sdcard/") + name;
-    esp_err_t err = copy_file_overwrite(src.c_str(), dst.c_str());
-    if (err != ESP_OK) last_err = err;
   }
-
-  closedir(d);
-  unmount_sd_spi("/sdcard");
   return last_err;
 }
-// Delete all regular files on SPIFFS, except Station.txt.
-static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
+
+static bool collect_spiffs_regular_files(std::vector<std::string>& out_files) {
+  out_files.clear();
   DIR* d = opendir("/spiffs");
-  if (!d) return ESP_FAIL;
+  if (!d) return false;
 
   struct dirent* ent;
   while ((ent = readdir(d)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-    if (strcmp(name, "Station.txt") == 0) continue;
-    std::string path = std::string("/spiffs/") + name;
+    std::string src = std::string("/spiffs/") + name;
     struct stat st;
-    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
-    unlink(path.c_str());  // ignore missing/err
+    if (stat(src.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    out_files.emplace_back(name);
   }
   closedir(d);
-  return ESP_OK;
+  std::sort(out_files.begin(), out_files.end());
+  return true;
+}
+
+static std::string today_qso_file_name() {
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t;
+  localtime_r(&now, &t);
+  char name[20];
+  snprintf(name, sizeof(name), "%04d%02d%02d.txt",
+           (t.tm_year + 1900) % 10000, (t.tm_mon + 1) % 100, t.tm_mday % 100);
+  return name;
+}
+
+// Copy all regular files from SPIFFS -> SD card, overwriting destination.
+static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
+  CopyLogsResult result{};
+  esp_err_t mret = ensure_sdcard_mounted();
+  if (mret != ESP_OK) {
+    std::vector<std::string> files;
+    int candidate_count = 0;
+    if (collect_spiffs_regular_files(files)) {
+      candidate_count = (int)files.size();
+    }
+    result.err = mret;
+    result.missed_count = std::max(1, candidate_count);
+    return result;
+  }
+  vTaskDelay(pdMS_TO_TICKS(100));
+
+  std::unordered_map<std::string, bool> copied_ok;
+  bool scan_failed = false;
+
+  auto set_copy_status = [&](const std::string& name, esp_err_t err) {
+    auto it = copied_ok.find(name);
+    if (err == ESP_OK) {
+      copied_ok[name] = true;
+      return;
+    }
+    if (it == copied_ok.end()) copied_ok[name] = false;
+  };
+
+  auto copy_pass = [&]() {
+    std::vector<std::string> files;
+    if (!collect_spiffs_regular_files(files)) {
+      scan_failed = true;
+      return;
+    }
+    for (const auto& name : files) {
+      auto it = copied_ok.find(name);
+      if (it != copied_ok.end() && it->second) continue;
+      const std::string src = std::string("/spiffs/") + name;
+      const std::string dst = std::string("/sdcard/") + name;
+      esp_err_t err = copy_file_overwrite_retry(src.c_str(), dst.c_str());
+      set_copy_status(name, err);
+    }
+  };
+
+  copy_pass();
+  vTaskDelay(pdMS_TO_TICKS(120));
+  copy_pass();
+
+  const std::string qso_name = today_qso_file_name();
+  const std::string qso_src = std::string("/spiffs/") + qso_name;
+  struct stat qso_st;
+  if (stat(qso_src.c_str(), &qso_st) == 0 && S_ISREG(qso_st.st_mode)) {
+    const std::string qso_dst = std::string("/sdcard/") + qso_name;
+    esp_err_t err = copy_file_overwrite_retry(qso_src.c_str(), qso_dst.c_str(), 6, 100);
+    set_copy_status(qso_name, err);
+  }
+
+  for (const auto& kv : copied_ok) {
+    if (kv.second) result.copied_count++;
+    else result.missed_count++;
+  }
+  if (scan_failed && copied_ok.empty()) {
+    result.missed_count = std::max(1, result.missed_count);
+  }
+  result.err = (result.missed_count == 0) ? ESP_OK : ESP_FAIL;
+
+  unmount_sd_spi("/sdcard");
+  return result;
 }
 
 #define CALLSIGN_HASHTABLE_SIZE 256
@@ -1202,7 +1262,9 @@ static std::string menu_long_buf;
 static std::string menu_long_backup;
 static int menu_flash_idx = -1;          // absolute index to flash highlight
 static int64_t menu_flash_deadline = 0;  // ms timestamp when flash ends
-static bool menu_delete_confirm = false;  // confirmation state for Delete Logs
+static std::string menu_copy_feedback_text;
+static int64_t menu_copy_feedback_deadline = 0;
+static constexpr int64_t kMenuCopyFeedbackMs = 1800;
 static int rx_flash_idx = -1;
 static int64_t rx_flash_deadline = 0;
 enum class TouchKbdEditTarget { None, MenuLong, MenuEdit, BandFreq, StatusDate, StatusTime };
@@ -2367,14 +2429,20 @@ static void check_slot_boundary() {
   }
 }
 
-  static void menu_flash_tick() {
-    if (menu_flash_idx < 0) return;
-    int64_t now = rtc_now_ms();
-    if (now >= menu_flash_deadline) {
-      menu_flash_idx = -1;
-      if (ui_mode == UIMode::MENU && !menu_long_edit && menu_edit_idx < 0) {
-        draw_menu_view();
-      }
+static void menu_flash_tick() {
+  int64_t now = rtc_now_ms();
+  bool redraw = false;
+  if (menu_flash_idx >= 0 && now >= menu_flash_deadline) {
+    menu_flash_idx = -1;
+    redraw = true;
+  }
+  if (menu_copy_feedback_deadline > 0 && now >= menu_copy_feedback_deadline) {
+    menu_copy_feedback_deadline = 0;
+    menu_copy_feedback_text.clear();
+    redraw = true;
+  }
+  if (redraw && ui_mode == UIMode::MENU && !menu_long_edit && menu_edit_idx < 0) {
+    draw_menu_view();
   }
 }
 
@@ -3299,7 +3367,7 @@ static void touch_keyboard_commit_current() {
         g_offset_hz = atoi(menu_edit_buf.c_str());
       } else if (menu_edit_idx == 10) {
         g_comment1 = menu_edit_buf;
-      } else if (menu_edit_idx == 15) {
+      } else if (menu_edit_idx == 17) {
         int v = atoi(menu_edit_buf.c_str());
         if (v < 0) v = 0;
         g_autoseq_max_retry = v;
@@ -3496,7 +3564,7 @@ static const char* menu_edit_label(int idx) {
     case 7:  return "Cursor";
     case 9:  return "IgnoreList";
     case 10: return "Comment";
-    case 15: return "Max Retry";
+    case 17: return "Max Retry";
     default: return "Edit";
   }
 }
@@ -3756,8 +3824,13 @@ static void draw_menu_view() {
     draw_touch_keyboard_overlay(std::string(menu_edit_label(menu_edit_idx)) + ": " + menu_edit_buf);
     return;
   }
+  int64_t now = rtc_now_ms();
+  if (menu_copy_feedback_deadline > 0 && now >= menu_copy_feedback_deadline) {
+    menu_copy_feedback_deadline = 0;
+    menu_copy_feedback_text.clear();
+  }
   std::vector<std::string> lines;
-  lines.reserve(12);
+  lines.reserve(18);
 
   std::string cq_line = std::string("CQ Type:");
   if (g_cq_type == CqType::CQFREETEXT) cq_line += g_cq_freetext;
@@ -3784,16 +3857,19 @@ static void draw_menu_view() {
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
   lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, kActiveBandMaxChars));
-  if (menu_edit_idx == 15) {
+  lines.push_back("");
+  if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
+    lines.push_back(menu_copy_feedback_text);
+  } else {
+    lines.push_back("Copy Files to SD");
+  }
+  if (menu_edit_idx == 17) {
     lines.push_back(std::string("Max Retry:") + menu_edit_buf);
   } else {
     lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
   }
-  lines.push_back("Copy Files to SD");
-  lines.push_back(menu_delete_confirm ? "Delete All Files? ^:Y v:N" : "Delete All Files");
 
   int highlight_abs = -1;
-  int64_t now = rtc_now_ms();
   if (menu_edit_idx >= 0) {
     highlight_abs = menu_edit_idx;
   } else if (menu_flash_idx >= 0 && now < menu_flash_deadline) {
@@ -4142,9 +4218,7 @@ static std::string ble_menu_long_edit_label() {
 static std::string ble_text_mode_line7() {
   std::string item = "Edit";
 
-  if (menu_delete_confirm) {
-    item = "Delete All Files";
-  } else if (menu_long_edit) {
+  if (menu_long_edit) {
     item = ble_menu_long_edit_label();
   } else if (menu_edit_idx >= 0) {
     item = menu_edit_label(menu_edit_idx);
@@ -5042,7 +5116,6 @@ static void enter_mode(UIMode new_mode) {
       menu_page = 0;
       menu_edit_idx = -1;
       menu_edit_buf.clear();
-      menu_delete_confirm = false;
       draw_menu_view();
       break;
     case UIMode::DEBUG:
@@ -5098,8 +5171,7 @@ static void ble_exit_text_mode() {
 }
 
 static bool ble_text_target_active() {
-  return menu_delete_confirm ||
-         menu_long_edit ||
+  return menu_long_edit ||
          menu_edit_idx >= 0 ||
          band_edit_idx >= 0 ||
          status_edit_idx == 4 ||
@@ -5108,23 +5180,6 @@ static bool ble_text_target_active() {
 
 static void ble_commit_text_input(const BleUiInput& input) {
   std::string value = ble_trim_trailing_crlf(input.data, input.len);
-
-  if (menu_delete_confirm) {
-    const char ans = value.empty() ? '\0' : value[0];
-    if (ans == 'Y' || ans == 'y') {
-      esp_err_t err = delete_logs_on_spiffs_keep_stationdata();
-      menu_delete_confirm = false;
-      menu_flash_idx = 17; // abs index of line 6 on page 2
-      menu_flash_deadline = rtc_now_ms() + 500;
-      debug_log_line(err == ESP_OK ? "Logs deleted" : "Delete failed");
-      draw_menu_view();
-    } else {
-      menu_delete_confirm = false;
-      draw_menu_view();
-    }
-    ble_exit_text_mode();
-    return;
-  }
 
   if (menu_long_edit) {
     const size_t kTouchTextMax = sizeof(g_touchkbd_buffer) - 1;
@@ -5158,7 +5213,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
   }
 
   if (menu_edit_idx >= 0) {
-    const size_t max_len = (menu_edit_idx == 7 || menu_edit_idx == 15) ? 10 : (sizeof(g_touchkbd_buffer) - 1);
+    const size_t max_len = (menu_edit_idx == 7 || menu_edit_idx == 17) ? 10 : (sizeof(g_touchkbd_buffer) - 1);
     if (value.size() > max_len) value.resize(max_len);
     menu_edit_buf = normalize_menu_edit_case(menu_edit_idx, value);
 
@@ -5174,7 +5229,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
       g_offset_hz = atoi(menu_edit_buf.c_str());
     } else if (menu_edit_idx == 10) {
       g_comment1 = menu_edit_buf;
-    } else if (menu_edit_idx == 15) {
+    } else if (menu_edit_idx == 17) {
       int v = atoi(menu_edit_buf.c_str());
       if (v < 0) v = 0;
       g_autoseq_max_retry = v;
@@ -5584,7 +5639,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       status_cursor_pos = -1;
     }
   };
-  if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit || menu_delete_confirm))) {
+  if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit))) {
       // Mode switch keys (disabled while editing in MENU)
       if (c == 'r' || c == 'R') { cancel_status_edit(); enter_mode(UIMode::RX); ui_force_redraw_rx(); ui_draw_rx(); switched = true; }
       else if (c == 't' || c == 'T') { cancel_status_edit(); enter_mode(ui_mode == UIMode::TX ? UIMode::RX : UIMode::TX); switched = true; }
@@ -6033,7 +6088,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
-                else if (menu_edit_idx == 15) {
+                else if (menu_edit_idx == 17) {
                   int v = atoi(menu_edit_buf.c_str());
                   if (v < 0) v = 0;
                   g_autoseq_max_retry = v;
@@ -6055,7 +6110,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 draw_menu_view();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
-                if (menu_edit_idx == 15 && !(ch >= '0' && ch <= '9')) {
+                if (menu_edit_idx == 17 && !(ch >= '0' && ch <= '9')) {
                   break;
                 }
                 if (menu_edit_idx == 7 && !((ch >= '0' && ch <= '9') || ch == '-')) {
@@ -6065,23 +6120,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   ch = toupper((unsigned char)ch);
                 }
                 menu_edit_buf.push_back(ch);
-                draw_menu_view();
-              }
-              break;
-            }
-            if (menu_delete_confirm) {
-              // Confirmation prompt for "Delete Logs" (page 2 line 6)
-              // Temporary touch-first confirm mapping:
-              // '^' command key -> ';' => YES, 'v' command key -> '.' => NO.
-              if (c == 'Y' || c == 'y' || c == ';') {
-                esp_err_t err = delete_logs_on_spiffs_keep_stationdata();
-                menu_delete_confirm = false;
-                menu_flash_idx = 17; // abs index of line 6 on page 2
-                menu_flash_deadline = rtc_now_ms() + 500;
-                debug_log_line(err == ESP_OK ? "Logs deleted" : "Delete failed");
-                draw_menu_view();
-              } else if (c == 'N' || c == 'n' || c == '.' || c == '`') {
-                menu_delete_confirm = false;
                 draw_menu_view();
               }
               break;
@@ -6212,27 +6250,35 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 if (c_from_ble) ble_enter_text_mode();
 #endif
               } else if (c == '4') {
-                menu_edit_idx = 15; // Max Retry line
-                menu_edit_buf = std::to_string(g_autoseq_max_retry);
-                draw_menu_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
+                // O-4 intentionally left open.
               } else if (c == '5') {
-                esp_err_t err = copy_logs_spiffs_to_sd_overwrite();
+                CopyLogsResult copy_res = copy_logs_spiffs_to_sd_overwrite();
                 menu_flash_idx = 16; // abs index of page 2 line 5
                 menu_flash_deadline = rtc_now_ms() + 500;
-                if (err == ESP_OK) {
-                  debug_log_line("Copied SPIFFS files to SD");
+                if (copy_res.missed_count <= 0) {
+                  menu_copy_feedback_text = "Copied OK";
                 } else {
-                  //char buf[64];
-                  //snprintf(buf, sizeof(buf), "f:%x %s", (unsigned)err, esp_err_to_name(err));
-                  //debug_log_line(buf);
+                  char fb[20];
+                  snprintf(fb, sizeof(fb), "Missed %d", copy_res.missed_count);
+                  menu_copy_feedback_text = fb;
+                }
+                if (menu_copy_feedback_text.size() > 19) {
+                  menu_copy_feedback_text.resize(19);
+                }
+                menu_copy_feedback_deadline = rtc_now_ms() + kMenuCopyFeedbackMs;
+
+                char log_msg[64];
+                snprintf(log_msg, sizeof(log_msg), "Copy SD C%d M%d",
+                         copy_res.copied_count, copy_res.missed_count);
+                debug_log_line(log_msg);
+                if (copy_res.err == ESP_OK) {
+                  debug_log_line("Copied SPIFFS files to SD");
                 }
 
                 draw_menu_view();
               } else if (c == '6') {
-                menu_delete_confirm = true;
+                menu_edit_idx = 17; // Max Retry line
+                menu_edit_buf = std::to_string(g_autoseq_max_retry);
                 draw_menu_view();
 #if ENABLE_BLE
                 if (c_from_ble) ble_enter_text_mode();
