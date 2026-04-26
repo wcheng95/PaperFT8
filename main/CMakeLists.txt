@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS
-        "main_ref.cpp"
+        "main.cpp"
         "autoseq.cpp"
         "resample.cpp"
         "stream_uac.cpp"
