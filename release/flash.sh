@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bash helper to flash PaperFT8 merged firmware image on Linux (ESP32-S3, 8MB)
+# Bash helper to flash PaperFT8 merged firmware image on Linux (ESP32-S3, 16MB)
 # Usage:
 #   1) Install esptool (recommended):
 #        sudo apt install -y pipx
@@ -58,7 +58,7 @@ echo "  File: $BIN_IN"
 esptool --chip "$CHIP" -p "$PORT" -b "$BAUD" \
   --before default_reset --after hard_reset \
   write_flash \
-  --flash-mode dio --flash-size 8MB --flash-freq 80m \
+  --flash-mode dio --flash-size 16MB --flash-freq 80m \
   0x0 "$BIN_IN"
 
 echo "Done."
