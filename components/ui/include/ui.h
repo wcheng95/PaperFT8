@@ -51,6 +51,7 @@ void ui_set_paused(bool paused);
 bool ui_is_paused();
 void ui_draw_rx(int flash_index = -1);
 void ui_force_redraw_rx();
+void ui_request_rx_full_refresh();
 const UiLayout& ui_layout();
 void ui_draw_mode_box(const char* mode_label);
 int ui_rx_hit_test(int x, int y); // returns absolute index or -1

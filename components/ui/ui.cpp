@@ -105,6 +105,7 @@ struct RxDrawCacheEntry {
 };
 static std::vector<RxDrawCacheEntry> last_drawn_cache;
 static int last_page = -1;
+static bool g_rx_full_refresh_requested = false;
 static std::string g_visible_rows[RX_LINES];
 
 struct GlyphBitmapCache {
@@ -188,6 +189,21 @@ static int text_row_y(int row_idx) {
 static void refresh_text_row_locked(int row_idx) {
     if (row_idx < 0 || row_idx >= RX_LINES) return;
     M5.Display.display(0, text_row_y(row_idx), g_layout.screen_w, kLineHeightPx);
+}
+
+static void flush_full_screen_quality_locked() {
+    g_display_pending = false;
+    M5.Display.waitDisplay();
+    if (!M5.Display.isEPD()) {
+        M5.Display.display(0, 0, g_layout.screen_w, g_layout.screen_h);
+        return;
+    }
+
+    const epd_mode_t previous_mode = M5.Display.getEpdMode();
+    M5.Display.setEpdMode(epd_mode_t::epd_quality);
+    M5.Display.display(0, 0, g_layout.screen_w, g_layout.screen_h);
+    M5.Display.waitDisplay();
+    M5.Display.setEpdMode(previous_mode);
 }
 
 static int glyph_advance_px(const lv_font_glyph_dsc_t& gd, int scale) {
@@ -756,6 +772,13 @@ void ui_force_redraw_rx() {
     last_page = -1;
 }
 
+void ui_request_rx_full_refresh() {
+    DispGuard guard;
+    g_rx_full_refresh_requested = true;
+    last_drawn_cache.clear();
+    last_page = -1;
+}
+
 static void draw_rx_line(int row_idx, const UiRxLine& l, int line_no, bool selected) {
     char buf[160];
     // Format: "<line> <freq(4)> <snr(3)> <message>"
@@ -774,7 +797,14 @@ static bool draw_rx_abs_line_locked(int absolute_idx, bool highlight) {
 }
 
 void ui_draw_rx(int flash_index) {
-    if (!rx_lines.empty() && flash_index < 0) {
+    bool full_refresh = false;
+    {
+        DispGuard guard;
+        full_refresh = g_rx_full_refresh_requested;
+        g_rx_full_refresh_requested = false;
+    }
+
+    if (!full_refresh && !rx_lines.empty() && flash_index < 0) {
         if (rx_page == last_page && last_drawn_cache.size() == rx_lines.size()) {
             bool same = true;
             for (size_t i = 0; i < rx_lines.size(); ++i) {
@@ -808,7 +838,11 @@ void ui_draw_rx(int flash_index) {
     // RX page navigation cues on ^ / v buttons.
     draw_command_button_locked(kCmdIdxPrev);
     draw_command_button_locked(kCmdIdxNext);
-    request_display_flush();
+    if (full_refresh) {
+        flush_full_screen_quality_locked();
+    } else {
+        request_display_flush();
+    }
 
     if (flash_index < 0) {
         last_page = rx_page;

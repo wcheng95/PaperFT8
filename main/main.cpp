@@ -1067,6 +1067,8 @@ static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static std::vector<UiRxLine> g_rx_lines;
 static volatile bool g_tx_view_dirty = false;  // Set when autoseq state changes
+static constexpr int kRxFullRefreshSlotInterval = 10;
+static int64_t g_rx_full_refresh_last_slot = -1;
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 
 // State machine variables (matching reference project architecture)
@@ -1373,6 +1375,9 @@ static std::string expand_comment_macros(const std::string& src);
 static void update_countdown();
 static void menu_flash_tick();
 static void rx_flash_tick();
+static void draw_rx_page(int flash_index = -1);
+static void scroll_rx_page(int delta);
+static int handle_rx_key_with_refresh(char c);
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
@@ -2823,7 +2828,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   if (num_candidates <= 0) {
     ESP_LOGW(TAG, "No candidates found");
     g_rx_lines.clear();
-    if (update_ui) { ui_set_rx_list(g_rx_lines); ui_draw_rx(); }
+    if (update_ui) { ui_set_rx_list(g_rx_lines); draw_rx_page(); }
     else g_rx_dirty = true;
     ble_publish_decode_event(0);
     g_decode_in_progress = false;  // Clear flag before early return
@@ -3057,7 +3062,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
   if (update_ui) {
     ui_set_rx_list(g_rx_lines);
-    ui_draw_rx();
+    draw_rx_page();
     char buf[64];
     snprintf(buf, sizeof(buf), "Heap %u", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
     debug_log_line(buf);
@@ -5174,6 +5179,38 @@ static void save_station_data() {
   fclose(f);
 }
 
+static void request_rx_full_refresh_if_due() {
+  if (kRxFullRefreshSlotInterval <= 0) return;
+
+  const int64_t slot_idx = rtc_now_ms() / 15000LL;
+  if (g_rx_full_refresh_last_slot < 0 || slot_idx < g_rx_full_refresh_last_slot) {
+    g_rx_full_refresh_last_slot = slot_idx;
+    return;
+  }
+
+  if ((slot_idx - g_rx_full_refresh_last_slot) >= kRxFullRefreshSlotInterval) {
+    ui_request_rx_full_refresh();
+    g_rx_full_refresh_last_slot = slot_idx;
+  }
+}
+
+static void draw_rx_page(int flash_index) {
+  request_rx_full_refresh_if_due();
+  ui_draw_rx(flash_index);
+}
+
+static void scroll_rx_page(int delta) {
+  request_rx_full_refresh_if_due();
+  ui_rx_scroll(delta);
+}
+
+static int handle_rx_key_with_refresh(char c) {
+  if (c == ';' || c == '.') {
+    request_rx_full_refresh_if_due();
+  }
+  return ui_handle_rx_key(c);
+}
+
 static void enter_mode(UIMode new_mode) {
   // No special handling needed when leaving TX mode - autoseq manages queue internally
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
@@ -5214,7 +5251,7 @@ static void enter_mode(UIMode new_mode) {
       ui_draw_mode_box("R");
       // Force RX list redraw
       ui_force_redraw_rx();
-      ui_draw_rx();
+      draw_rx_page();
       break;
     case UIMode::TX:
       ui_set_active_mode_button('T');
@@ -5465,7 +5502,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     ui_draw_debug(g_startup_lines, 0);
   } else {
     ui_force_redraw_rx();
-    ui_draw_rx();
+    draw_rx_page();
   }
 
   ESP_LOGI(TAG, "Free heap: %u, internal: %u, 8bit: %u",
@@ -5508,14 +5545,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         int dir = (ge.action == GestureAction::SwipeLeft) ? 1 : -1;
         UIMode next = swipe_next_mode(ui_mode, dir);
         enter_mode(next);
-        if (next == UIMode::RX) {
-          ui_force_redraw_rx();
-          ui_draw_rx();
-        }
       } else if (ge.action == GestureAction::SwipeUp || ge.action == GestureAction::SwipeDown) {
         int delta = (ge.action == GestureAction::SwipeDown) ? 1 : -1;
         if (ui_mode == UIMode::RX) {
-          ui_rx_scroll(delta);
+          scroll_rx_page(delta);
         }
       }
     }
@@ -5577,7 +5610,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         last_key = c;
         // Non-mode startup dismissal keeps prior behavior: show RX and consume key.
         ui_force_redraw_rx();
-        ui_draw_rx();
+        draw_rx_page();
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
@@ -5672,7 +5705,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     if (c == 0) {
       if (g_rx_dirty && ui_mode == UIMode::RX) {
         ui_set_rx_list(g_rx_lines);
-        ui_draw_rx(rx_flash_idx);
+        draw_rx_page(rx_flash_idx);
         g_rx_dirty = false;
       }
       if (ui_mode == UIMode::TX && g_tx_view_dirty) {
@@ -5745,7 +5778,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   if (g_rx_dirty && ui_mode == UIMode::RX) {
       ui_set_rx_list(g_rx_lines);
-      ui_draw_rx(rx_flash_idx);
+      draw_rx_page(rx_flash_idx);
       g_rx_dirty = false;
   }
   ui_draw_waterfall_if_dirty();
@@ -5760,7 +5793,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   };
   if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit))) {
       // Mode switch keys (disabled while editing in MENU)
-      if (c == 'r' || c == 'R') { cancel_status_edit(); enter_mode(UIMode::RX); ui_force_redraw_rx(); ui_draw_rx(); switched = true; }
+      if (c == 'r' || c == 'R') { cancel_status_edit(); enter_mode(UIMode::RX); switched = true; }
       else if (c == 't' || c == 'T') { cancel_status_edit(); enter_mode(ui_mode == UIMode::TX ? UIMode::RX : UIMode::TX); switched = true; }
       else if (c == 'b' || c == 'B') { cancel_status_edit(); enter_mode(ui_mode == UIMode::BAND ? UIMode::RX : UIMode::BAND); switched = true; }
       else if (c == 'm' || c == 'M') {
@@ -5846,7 +5879,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     // Mode-specific handling
     switch (ui_mode) {
       case UIMode::RX: {
-        int sel = ui_handle_rx_key(c);
+        int sel = handle_rx_key_with_refresh(c);
         if (sel >= 0 && sel < (int)g_rx_lines.size()) {
           if (rx_flash_idx >= 0 && rx_flash_idx != sel) {
             ui_flash_rx_line(rx_flash_idx, false);
