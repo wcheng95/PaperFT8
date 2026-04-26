@@ -4466,17 +4466,17 @@ static void ble_mirror_tick() {
     g_ble_last_tick_sec = sec;
   }
 
-  std::string out;
-  out.reserve(screen_key.size() + 120);
-  out += "\n";
-  out += std::string(29, '=');
-  out += "\n";
-  out += g_ble_waterfall_header.empty() ? ble_blank_waterfall_header() : g_ble_waterfall_header;
-  out += "\n";
-  out += "---.----+----.----+----.----+";
-  out += "\n";
-  out += screen_key;
-  ble_notify_payload(out);
+  ble_notify_line("");
+  ble_notify_line(std::string(29, '='));
+  ble_notify_line(g_ble_waterfall_header.empty() ? ble_blank_waterfall_header()
+                                               : g_ble_waterfall_header);
+  ble_notify_line("---.----+----.----+----.----+");
+
+  for (int i = 0; i < 6; ++i) {
+    ble_notify_line(lines[i]);
+  }
+
+  ble_notify_line(line7);
 }
 
 static void ble_countdown_tick() {
